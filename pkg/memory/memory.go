@@ -24,8 +24,8 @@ type ToolCall struct {
 	ID       string `json:"id"`
 	Type     string `json:"type"`
 	Function struct {
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
+		Name      string `json:"name,omitempty"`
+		Arguments string `json:"arguments,omitempty"`
 	} `json:"function"`
 }
 

@@ -9,6 +9,7 @@ import (
 
 	"cardinal/pkg/api"
 	"cardinal/pkg/config"
+	"cardinal/pkg/memory"
 	"cardinal/pkg/storage"
 	"cardinal/pkg/tools"
 
@@ -53,6 +54,7 @@ type Model struct {
 	lastStatus       string
 	contextUsed      int
 	contextLimit     int
+	memoryIntegration  *memory.MemoryIntegration
 }
 
 var slashCommands = []string{
@@ -86,6 +88,13 @@ func NewModel(cfg *config.Config) Model {
 	vp := viewport.New(80, 20)
 	vp.SetContent("")
 
+	// Initialize memory integration
+	memIntegration, err := memory.NewIntegration()
+	if err != nil {
+		// Log but continue - memory is optional
+		fmt.Fprintf(os.Stderr, "Warning: memory integration failed: %v\n", err)
+	}
+
 	return Model{
 		input:        ti,
 		spinner:      s,
@@ -98,6 +107,7 @@ func NewModel(cfg *config.Config) Model {
 		viewport:     vp,
 		autoApprove:  false,
 		contextLimit: 128000,
+		memoryIntegration: memIntegration,
 	}
 }
 
