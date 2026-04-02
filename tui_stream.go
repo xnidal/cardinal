@@ -110,6 +110,26 @@ func calculateBackoff(attempt int) time.Duration {
 }
 
 func (m Model) buildMessages() []api.Message {
+	// Try to load context from memory if available
+	if m.memoryIntegration != nil {
+		// Get the last user message as the current prompt
+		var currentPrompt string
+		if len(m.messages) > 0 {
+			lastMsg := m.messages[len(m.messages)-1]
+			if lastMsg.Role == "user" {
+				currentPrompt = lastMsg.Content
+			}
+		}
+
+		// Load full context from memory
+		memoryMessages, err := m.memoryIntegration.LoadContext(currentPrompt, "cardinal")
+		if err == nil && len(memoryMessages) > 0 {
+			// Use memory context instead of just current messages
+			return m.compressMessages(memoryMessages)
+		}
+	}
+
+	// Fallback to current behavior
 	systemPrompt := m.getSystemPrompt()
 	messages := append([]api.Message{{Role: "system", Content: systemPrompt}}, m.messages...)
 	messages = m.compressMessages(messages)
@@ -372,6 +392,11 @@ func (m *Model) addAssistantMessage(content string, toolCalls ...api.ToolCall) {
 	}
 	m.messages = append(m.messages, msg)
 	m.lastMessages = append([]api.Message(nil), m.messages...)
+
+	// Save to memory if available
+	if m.memoryIntegration != nil {
+		m.memoryIntegration.SaveMessage("assistant", content, "cardinal")
+	}
 }
 
 // addToolResult adds a tool result message to the history

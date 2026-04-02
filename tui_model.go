@@ -266,6 +266,12 @@ func (m Model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.suggestions = nil
 		m.scrollOffset = 0
 		m.useViewport = false
+
+		// Save user message to memory
+		if m.memoryIntegration != nil {
+			m.memoryIntegration.SaveMessage("user", value, "cardinal")
+		}
+
 		return m.beginStream()
 
 	case tea.KeyTab:
