@@ -13,319 +13,258 @@ import (
 type Message struct {
 	Role      string    `json:"role"`
 	Content   string    `json:"content"`
-	Name      string    `json:"name,omitempty"`
-	Source    string    `json:"source,omitempty"`    // where this message came from (discord, cli, tui)
+	Name      string    `json:"name,omitempty"`      // for tool messages
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
+	Source    string    `json:"source,omitempty"` // where this message came from (discord, terminal, etc)
 }
 
-// Summary represents a compressed summary of a conversation segment
-type Summary struct {
-	Content   string    `json:"content"`
+// ToolCall represents a tool call in a message
+type ToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// Session represents a conversation session
+type Session struct {
+	ID        string    `json:"id"`
 	StartTime time.Time `json:"start_time"`
-	EndTime   time.Time `json:"end_time"`
-	MessageCount int    `json:"message_count"`
-	Topics    []string  `json:"topics,omitempty"`
+	EndTime   time.Time `json:"end_time,omitempty"`
+	Messages  []Message `json:"messages"`
+	Summary   string    `json:"summary,omitempty"`
 }
 
-// MemoryStore manages persistent conversation history
+// MemoryStore handles persistent conversation storage
 type MemoryStore struct {
-	configDir string
-	messages  []Message
-	summaries []Summary
+	dataDir string
+	current *Session
 }
 
 // NewMemoryStore creates a new memory store
 func NewMemoryStore() (*MemoryStore, error) {
-	configDir := getConfigPath()
-	if err := os.MkdirAll(configDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create config directory: %w", err)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	dataDir := filepath.Join(home, ".cardinal", "memory")
+
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, err
 	}
 
 	ms := &MemoryStore{
-		configDir: configDir,
-		messages:  make([]Message, 0),
-		summaries: make([]Summary, 0),
+		dataDir: dataDir,
 	}
 
-	if err := ms.load(); err != nil {
-		// If file doesn't exist, that's fine - start fresh
-		if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("failed to load memory: %w", err)
+	// Load or create current session
+	if err := ms.loadCurrentSession(); err != nil {
+		// Create new session if none exists
+		ms.current = &Session{
+			ID:        generateID(),
+			StartTime: time.Now(),
+			Messages:  []Message{},
 		}
+		ms.saveCurrentSession()
 	}
 
 	return ms, nil
 }
 
-func getConfigPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ".cardinal"
-	}
-	return filepath.Join(home, ".cardinal")
-}
-
-// load reads existing memory from disk
-func (ms *MemoryStore) load() error {
-	messagesPath := filepath.Join(ms.configDir, "history.jsonl")
-	data, err := os.ReadFile(messagesPath)
+// loadCurrentSession loads the most recent session
+func (ms *MemoryStore) loadCurrentSession() error {
+	// Find the most recent session file
+	files, err := os.ReadDir(ms.dataDir)
 	if err != nil {
 		return err
 	}
 
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
+	var latestFile string
+	var latestTime time.Time
+
+	for _, file := range files {
+		if !strings.HasSuffix(file.Name(), ".json") {
 			continue
 		}
-		var msg Message
-		if err := json.Unmarshal([]byte(line), &msg); err != nil {
-			continue // skip malformed lines
+
+		info, err := file.Info()
+		if err != nil {
+			continue
 		}
-		ms.messages = append(ms.messages, msg)
+
+		if info.ModTime().After(latestTime) {
+			latestTime = info.ModTime()
+			latestFile = file.Name()
+		}
 	}
 
-	// Load summaries if they exist
-	summariesPath := filepath.Join(ms.configDir, "summaries.json")
-	if data, err := os.ReadFile(summariesPath); err == nil {
-		json.Unmarshal(data, &ms.summaries)
+	if latestFile == "" {
+		return fmt.Errorf("no session files found")
 	}
 
+	data, err := os.ReadFile(filepath.Join(ms.dataDir, latestFile))
+	if err != nil {
+		return err
+	}
+
+	var session Session
+	if err := json.Unmarshal(data, &session); err != nil {
+		return err
+	}
+
+	ms.current = &session
 	return nil
 }
 
-// AddMessage adds a new message to the history
+// saveCurrentSession saves the current session to disk
+func (ms *MemoryStore) saveCurrentSession() error {
+	if ms.current == nil {
+		return nil
+	}
+
+	filename := fmt.Sprintf("%s.json", ms.current.ID)
+	path := filepath.Join(ms.dataDir, filename)
+
+	data, err := json.MarshalIndent(ms.current, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(path, data, 0644)
+}
+
+// AddMessage adds a message to the current session
 func (ms *MemoryStore) AddMessage(role, content, source string) error {
 	msg := Message{
 		Role:      role,
 		Content:   content,
-		Source:    source,
 		Timestamp: time.Now(),
+		Source:    source,
 	}
-	ms.messages = append(ms.messages, msg)
-	return ms.appendMessage(msg)
+
+	ms.current.Messages = append(ms.current.Messages, msg)
+	return ms.saveCurrentSession()
 }
 
-// appendMessage appends a single message to the history file
-func (ms *MemoryStore) appendMessage(msg Message) error {
-	messagesPath := filepath.Join(ms.configDir, "history.jsonl")
-
-	// Open file in append mode
-	f, err := os.OpenFile(messagesPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return err
+// AddMessageWithToolCalls adds a message with tool calls
+func (ms *MemoryStore) AddMessageWithToolCalls(role, content, source string, toolCalls []ToolCall) error {
+	msg := Message{
+		Role:      role,
+		Content:   content,
+		Timestamp: time.Now(),
+		Source:    source,
+		ToolCalls: toolCalls,
 	}
 
-	_, err = f.WriteString(string(data) + "\n")
-	return err
+	ms.current.Messages = append(ms.current.Messages, msg)
+	return ms.saveCurrentSession()
 }
 
-// GetMessages returns all messages, optionally filtered
-func (ms *MemoryStore) GetMessages(since time.Duration) []Message {
-	if since == 0 {
-		return ms.messages
-	}
-
-	cutoff := time.Now().Add(-since)
-	var result []Message
-	for _, msg := range ms.messages {
-		if msg.Timestamp.After(cutoff) {
-			result = append(result, msg)
-		}
-	}
-	return result
-}
-
-// GetRecentMessages returns the last N messages
+// GetRecentMessages returns the last n messages
 func (ms *MemoryStore) GetRecentMessages(n int) []Message {
-	if n <= 0 || len(ms.messages) == 0 {
-		return nil
+	if n <= 0 || n > len(ms.current.Messages) {
+		return ms.current.Messages
 	}
-
-	start := len(ms.messages) - n
-	if start < 0 {
-		start = 0
-	}
-	return ms.messages[start:]
+	return ms.current.Messages[len(ms.current.Messages)-n:]
 }
 
-// Grep searches through message history for a pattern
-func (ms *MemoryStore) Grep(pattern string, caseInsensitive bool) []Message {
-	var results []Message
-	searchPattern := pattern
-	if caseInsensitive {
-		searchPattern = strings.ToLower(pattern)
+// GetAllMessages returns all messages in the current session
+func (ms *MemoryStore) GetAllMessages() []Message {
+	return ms.current.Messages
+}
+
+// GetFullHistory returns all messages from all sessions (for context loading)
+func (ms *MemoryStore) GetFullHistory() ([]Message, error) {
+	var allMessages []Message
+
+	files, err := os.ReadDir(ms.dataDir)
+	if err != nil {
+		return nil, err
 	}
 
-	for _, msg := range ms.messages {
-		content := msg.Content
-		if caseInsensitive {
-			content = strings.ToLower(content)
+	// Sort files by name (which includes timestamp)
+	var sortedFiles []string
+	for _, file := range files {
+		if strings.HasSuffix(file.Name(), ".json") {
+			sortedFiles = append(sortedFiles, file.Name())
 		}
-		if strings.Contains(content, searchPattern) {
+	}
+
+	// Read each session
+	for _, filename := range sortedFiles {
+		data, err := os.ReadFile(filepath.Join(ms.dataDir, filename))
+		if err != nil {
+			continue
+		}
+
+		var session Session
+		if err := json.Unmarshal(data, &session); err != nil {
+			continue
+		}
+
+		allMessages = append(allMessages, session.Messages...)
+	}
+
+	return allMessages, nil
+}
+
+// Search searches for messages containing the query
+func (ms *MemoryStore) Search(query string) []Message {
+	var results []Message
+	query = strings.ToLower(query)
+
+	for _, msg := range ms.current.Messages {
+		if strings.Contains(strings.ToLower(msg.Content), query) {
 			results = append(results, msg)
 		}
 	}
+
 	return results
 }
 
-// Compress creates a summary of old messages to reduce context size
-func (ms *MemoryStore) Compress(olderThan time.Duration) (int, error) {
-	if len(ms.messages) == 0 {
-		return 0, nil
+// CompressOldMessages creates a summary of old messages to save context space
+func (ms *MemoryStore) CompressOldMessages(keepRecent int) (string, error) {
+	if len(ms.current.Messages) <= keepRecent {
+		return "", nil
 	}
 
-	cutoff := time.Now().Add(-olderThan)
+	oldMessages := ms.current.Messages[:len(ms.current.Messages)-keepRecent]
+	var summary strings.Builder
 
-	// Find messages to compress
-	var toCompress []Message
-	var keep []Message
-	for _, msg := range ms.messages {
-		if msg.Timestamp.Before(cutoff) {
-			toCompress = append(toCompress, msg)
-		} else {
-			keep = append(keep, msg)
+	summary.WriteString("Previous conversation summary:\n")
+	for _, msg := range oldMessages {
+		content := msg.Content
+		if len(content) > 100 {
+			content = content[:100] + "..."
 		}
+		content = strings.ReplaceAll(content, "\n", " ")
+		summary.WriteString(fmt.Sprintf("- [%s] %s\n", msg.Role, content))
 	}
 
-	if len(toCompress) == 0 {
-		return 0, nil
-	}
-
-	// Create summary
-	summary := Summary{
-		StartTime: toCompress[0].Timestamp,
-		EndTime:   toCompress[len(toCompress)-1].Timestamp,
-		MessageCount: len(toCompress),
-		Content:   generateSummary(toCompress),
-	}
-
-	ms.summaries = append(ms.summaries, summary)
-	ms.messages = keep
-
-	// Persist summaries
-	if err := ms.saveSummaries(); err != nil {
-		return 0, err
-	}
-
-	// Rewrite messages file with remaining messages
-	if err := ms.rewriteMessages(); err != nil {
-		return 0, err
-	}
-
-	return len(toCompress), nil
+	return summary.String(), nil
 }
 
-// GetSummaries returns all compressed summaries
-func (ms *MemoryStore) GetSummaries() []Summary {
-	return ms.summaries
+// GetStats returns memory statistics
+func (ms *MemoryStore) GetStats() map[string]interface{} {
+	return map[string]interface{}{
+		"session_id":       ms.current.ID,
+		"message_count":    len(ms.current.Messages),
+		"session_start":    ms.current.StartTime,
+		"total_characters": ms.countCharacters(),
+	}
 }
 
-// GetContextForPrompt builds context from recent messages and summaries
-func (ms *MemoryStore) GetContextForPrompt(maxMessages int, maxSummaryChars int) string {
-	var sb strings.Builder
-
-	// Add summaries first (compressed older context)
-	if len(ms.summaries) > 0 {
-		sb.WriteString("=== Previous Context (Summarized) ===\n")
-		totalSummaryLen := 0
-		for _, sum := range ms.summaries {
-			if totalSummaryLen + len(sum.Content) > maxSummaryChars {
-				break
-			}
-			sb.WriteString(fmt.Sprintf("[%s] %s\n", sum.StartTime.Format("2006-01-02"), sum.Content))
-			totalSummaryLen += len(sum.Content)
-		}
-		sb.WriteString("\n")
+func (ms *MemoryStore) countCharacters() int {
+	total := 0
+	for _, msg := range ms.current.Messages {
+		total += len(msg.Content)
 	}
-
-	// Add recent messages
-	recent := ms.GetRecentMessages(maxMessages)
-	if len(recent) > 0 {
-		sb.WriteString("=== Recent Messages ===\n")
-		for _, msg := range recent {
-			source := msg.Source
-			if source == "" {
-				source = "unknown"
-			}
-			sb.WriteString(fmt.Sprintf("[%s][%s] %s\n", source, msg.Role, truncate(msg.Content, 200)))
-		}
-	}
-
-	return sb.String()
+	return total
 }
 
-func (ms *MemoryStore) saveSummaries() error {
-	summariesPath := filepath.Join(ms.configDir, "summaries.json")
-	data, err := json.MarshalIndent(ms.summaries, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(summariesPath, data, 0644)
-}
-
-func (ms *MemoryStore) rewriteMessages() error {
-	messagesPath := filepath.Join(ms.configDir, "history.jsonl")
-
-	f, err := os.Create(messagesPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	for _, msg := range ms.messages {
-		data, _ := json.Marshal(msg)
-		f.WriteString(string(data) + "\n")
-	}
-	return nil
-}
-
-func generateSummary(messages []Message) string {
-	// Simple summary for now - could be enhanced with LLM
-	var roles []string
-	var sources []string
-	contentLen := 0
-
-	for _, msg := range messages {
-		roles = append(roles, msg.Role)
-		if msg.Source != "" {
-			sources = append(sources, msg.Source)
-		}
-		contentLen += len(msg.Content)
-	}
-
-	uniqueRoles := unique(roles)
-	uniqueSources := unique(sources)
-
-	return fmt.Sprintf("%d messages from %s via %s. Total content: %d chars.",
-		len(messages),
-		strings.Join(uniqueRoles, ", "),
-		strings.Join(uniqueSources, ", "),
-		contentLen)
-}
-
-func unique(slice []string) []string {
-	seen := make(map[string]bool)
-	var result []string
-	for _, s := range slice {
-		if !seen[s] {
-			seen[s] = true
-			result = append(result, s)
-		}
-	}
-	return result
-}
-
-func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
+func generateID() string {
+	return fmt.Sprintf("%d", time.Now().UnixNano())
 }
