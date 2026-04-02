@@ -232,8 +232,10 @@ func (m Model) handleStreamEvent(event api.StreamEvent) (tea.Model, tea.Cmd) {
 		return m, waitForStreamEvent(m.streamCh)
 
 	case "tool_call_writing":
-		if event.ToolCallName != "" {
-			m.status = fmt.Sprintf("Writing %s (%d chars)...", event.ToolCallName, event.ToolCallArgsLen)
+		if event.ToolCallName != "" && event.ToolCallArgsLen > 0 {
+			m.status = fmt.Sprintf("Writing tool call [%s] (%d characters)", event.ToolCallName, event.ToolCallArgsLen)
+		} else if event.ToolCallName != "" {
+			m.status = fmt.Sprintf("Writing tool call [%s]", event.ToolCallName)
 		} else {
 			m.status = "Writing tool call..."
 		}

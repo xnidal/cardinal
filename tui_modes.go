@@ -287,6 +287,10 @@ func (m Model) updateModelsMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(filtered) == 0 {
 				return m, nil
 			}
+			// Ensure selected is within bounds
+			if data.selected >= len(filtered) {
+				data.selected = len(filtered) - 1
+			}
 			selectedModel := filtered[data.selected].ID
 			m.cfg.SetModel(selectedModel)
 			m.messages = append(m.messages, api.Message{
@@ -303,6 +307,16 @@ func (m Model) updateModelsMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	data.filterInput, cmd = data.filterInput.Update(msg)
 	data.filter = strings.TrimSpace(data.filterInput.Value())
+
+	// Clamp selected within filtered list
+	filtered := filterModels(data.models, data.filter)
+	if len(filtered) > 0 && data.selected >= len(filtered) {
+		data.selected = len(filtered) - 1
+		if data.selected < 0 {
+			data.selected = 0
+		}
+	}
+
 	return m, cmd
 }
 
