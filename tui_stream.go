@@ -356,12 +356,10 @@ func (m *Model) addAssistantMessage(content string, toolCalls ...api.ToolCall) {
 		return
 	}
 
-	// Check for duplicate
+	// Skip if the last message has the exact same content
 	if len(m.messages) > 0 {
 		lastMsg := m.messages[len(m.messages)-1]
-		if lastMsg.Role == "assistant" &&
-			lastMsg.Content == content &&
-			len(lastMsg.ToolCalls) == len(toolCalls) {
+		if lastMsg.Role == "assistant" && lastMsg.Content == content {
 			return
 		}
 	}
@@ -433,13 +431,17 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 	}
 
 	// Only add message if we have content
+	// Clear streaming/thinking BEFORE adding to avoid duplicates
 	if strings.TrimSpace(msgContent) != "" {
+		m.streaming = ""
+		m.thinking = ""
 		m.addAssistantMessage(msgContent)
 		m.finalizeUIMessageHandling()
+	} else {
+		m.streaming = ""
+		m.thinking = ""
 	}
 
-	m.streaming = ""
-	m.thinking = ""
 	m.busy = false
 	m.status = "Ready"
 	return m, nil

@@ -429,13 +429,17 @@ func (m *Model) renderConversationContent() string {
 		blocks = append(blocks, dimStyle.Render(fmt.Sprintf(" ↑ %d lines scrolled", m.viewport.YOffset)))
 	}
 
-	for _, message := range m.messages {
+	visible := m.messages
+	for i, message := range visible {
 		if rendered := m.renderMessage(message); rendered != "" {
-			blocks = append(blocks, rendered, "")
+			blocks = append(blocks, rendered)
+		}
+		if i < len(visible)-1 {
+			blocks = append(blocks, "")
 		}
 	}
 
-	if hasStreaming || hasThinking {
+	if hasThinking || hasStreaming {
 		blocks = append(blocks, m.renderStreamingMessage())
 	}
 

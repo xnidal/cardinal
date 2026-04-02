@@ -205,8 +205,9 @@ func (m Model) renderHeader() string {
 
 func (m Model) renderConversation() string {
 	hasStreaming := strings.TrimSpace(m.streaming) != ""
+	hasThinking := strings.TrimSpace(m.thinking) != ""
 
-	if len(m.messages) == 0 && !hasStreaming && m.err == nil {
+	if len(m.messages) == 0 && !hasStreaming && !hasThinking && m.err == nil {
 		return m.renderWelcome()
 	}
 
@@ -221,13 +222,18 @@ func (m Model) renderConversation() string {
 		)
 	}
 
-	for _, message := range m.getVisibleMessages() {
+	visible := m.getVisibleMessages()
+	for i, message := range visible {
 		if rendered := m.renderMessage(message); rendered != "" {
-			blocks = append(blocks, rendered, "")
+			blocks = append(blocks, rendered)
+		}
+		// Add blank line between messages (not after last)
+		if i < len(visible)-1 {
+			blocks = append(blocks, "")
 		}
 	}
 
-	if hasStreaming {
+	if hasThinking || hasStreaming {
 		blocks = append(blocks, m.renderStreamingMessage())
 	}
 
@@ -319,29 +325,6 @@ func (m Model) renderMessage(msg api.Message) string {
 		blocks = append(blocks, contentBox)
 	}
 
-	if len(msg.ToolCalls) > 0 {
-		for _, tc := range msg.ToolCalls {
-			toolName := tc.Function.Name
-			args := strings.TrimSpace(tc.Function.Arguments)
-
-			var toolDisplay string
-			if args != "" && args != "{}" {
-				truncated := truncate(args, m.width-12)
-				toolDisplay = lipgloss.NewStyle().
-					Foreground(warningColor).
-					Render("  [tool] "+toolName) +
-					lipgloss.NewStyle().
-						Foreground(dimColor).
-						Render(" "+truncated)
-			} else {
-				toolDisplay = lipgloss.NewStyle().
-					Foreground(warningColor).
-					Render("  [tool] " + toolName)
-			}
-			blocks = append(blocks, toolDisplay)
-		}
-	}
-
 	return lipgloss.NewStyle().
 		MarginBottom(1).
 		Render(lipgloss.JoinVertical(lipgloss.Left, blocks...))
@@ -365,32 +348,20 @@ func (m Model) renderToolResult(msg api.Message) string {
 		linesInfo := extractLinesFromToolResult(msg.Content)
 		if linesInfo != "" {
 			content = lipgloss.NewStyle().
-				Foreground(successColor).
-				Render("[ok] read ") +
-				lipgloss.NewStyle().
-					Foreground(accentColor).
-					Render(displayPath) +
-				lipgloss.NewStyle().
-					Foreground(dimColor).
-					Render(" ("+linesInfo+")")
+				Foreground(accentColor).
+				Render("> read " + displayPath + " [" + linesInfo + "]")
 		} else {
 			content = lipgloss.NewStyle().
-				Foreground(successColor).
-				Render("[ok] read ") +
-				lipgloss.NewStyle().
-					Foreground(accentColor).
-					Render(displayPath)
+				Foreground(accentColor).
+				Render("> read " + displayPath)
 		}
 
 	case "list_files":
 		path := extractPathFromToolResult(msg.Content)
 		displayPath := m.formatPath(path)
 		content = lipgloss.NewStyle().
-			Foreground(successColor).
-			Render("[ok] list ") +
-			lipgloss.NewStyle().
-				Foreground(accentColor).
-				Render(displayPath)
+			Foreground(accentColor).
+			Render("> list " + displayPath)
 
 	case "bash":
 		content = m.formatBashOutput(msg.Content, maxHeight, maxWidth)
@@ -412,8 +383,8 @@ func (m Model) renderToolResult(msg api.Message) string {
 
 	case "edit_soul":
 		content = lipgloss.NewStyle().
-			Foreground(successColor).
-			Render("[ok] edit_soul")
+			Foreground(accentColor).
+			Render("> edit_soul")
 
 	case "calculate":
 		content = m.formatCalculateOutput(msg.Content, maxHeight, maxWidth)
@@ -440,9 +411,7 @@ func (m Model) formatBashOutput(content string, maxHeight, maxWidth int) string 
 
 	var formattedLines []string
 	formattedLines = append(formattedLines,
-		lipgloss.NewStyle().
-			Foreground(successColor).
-			Render("[ok] bash:"),
+		lipgloss.NewStyle().Foreground(accentColor).Render("> bash:"),
 	)
 
 	for _, line := range lines {
@@ -451,9 +420,7 @@ func (m Model) formatBashOutput(content string, maxHeight, maxWidth int) string 
 		}
 		if strings.TrimSpace(line) != "" {
 			formattedLines = append(formattedLines,
-				lipgloss.NewStyle().
-					Foreground(dimColor).
-					Render("    "+line),
+				lipgloss.NewStyle().Foreground(dimColor).Render("    "+line),
 			)
 		}
 	}
@@ -466,11 +433,8 @@ func (m Model) formatWriteFileOutput(content string, maxHeight, maxWidth int) st
 	displayPath := m.formatPath(path)
 
 	return lipgloss.NewStyle().
-		Foreground(successColor).
-		Render("[ok] write ") +
-		lipgloss.NewStyle().
-			Foreground(accentColor).
-			Render(displayPath)
+		Foreground(accentColor).
+		Render("> write " + displayPath)
 }
 
 func (m Model) formatCalculateOutput(content string, maxHeight, maxWidth int) string {
@@ -487,13 +451,10 @@ func (m Model) formatCalculateOutput(content string, maxHeight, maxWidth int) st
 	}
 	if len(outputLines) > 0 {
 		return lipgloss.NewStyle().
-			Foreground(successColor).
-			Render("[ok] calculate: ") +
-			lipgloss.NewStyle().
-				Foreground(accentColor).
-				Render(strings.Join(outputLines, " "))
+			Foreground(accentColor).
+			Render("> calculate: " + strings.Join(outputLines, " "))
 	}
-	return lipgloss.NewStyle().Foreground(successColor).Render("[ok] calculate")
+	return lipgloss.NewStyle().Foreground(accentColor).Render("> calculate")
 }
 
 func (m Model) formatEditFileOutput(content string, maxHeight, maxWidth int) string {
@@ -526,16 +487,13 @@ func (m Model) formatEditFileOutput(content string, maxHeight, maxWidth int) str
 			}
 		}
 		return lipgloss.NewStyle().
-			Foreground(successColor).
-			Render("[ok] edit "+displayPath+"\\n") +
-			strings.Join(coloredDiff, "\\n")
+			Foreground(accentColor).
+			Render("> edit "+displayPath+"\n") +
+			strings.Join(coloredDiff, "\n")
 	}
 	return lipgloss.NewStyle().
-		Foreground(successColor).
-		Render("[ok] edit ") +
-		lipgloss.NewStyle().
-			Foreground(accentColor).
-			Render(displayPath)
+		Foreground(accentColor).
+		Render("> edit " + displayPath)
 }
 
 func (m Model) formatGrepOutput(content string, maxHeight, maxWidth int) string {
@@ -551,7 +509,7 @@ func (m Model) formatGrepOutput(content string, maxHeight, maxWidth int) string 
 
 	var formattedLines []string
 	formattedLines = append(formattedLines,
-		lipgloss.NewStyle().Foreground(successColor).Render("[ok] grep:"),
+		lipgloss.NewStyle().Foreground(accentColor).Render("> grep:"),
 	)
 
 	for _, line := range lines {
@@ -565,11 +523,11 @@ func (m Model) formatGrepOutput(content string, maxHeight, maxWidth int) string 
 		}
 	}
 
-	return strings.Join(formattedLines, "\\n")
+	return strings.Join(formattedLines, "\n")
 }
 
 func (m Model) formatGlobOutput(content string, maxHeight, maxWidth int) string {
-	lines := strings.Split(content, "\\n")
+	lines := strings.Split(content, "\n")
 	if len(lines) > maxHeight {
 		lines = append(lines[:maxHeight],
 			lipgloss.NewStyle().
@@ -581,7 +539,7 @@ func (m Model) formatGlobOutput(content string, maxHeight, maxWidth int) string 
 
 	var formattedLines []string
 	formattedLines = append(formattedLines,
-		lipgloss.NewStyle().Foreground(successColor).Render("[ok] glob:"),
+		lipgloss.NewStyle().Foreground(accentColor).Render("> glob:"),
 	)
 
 	for _, line := range lines {
@@ -595,15 +553,15 @@ func (m Model) formatGlobOutput(content string, maxHeight, maxWidth int) string 
 		}
 	}
 
-	return strings.Join(formattedLines, "\\n")
+	return strings.Join(formattedLines, "\n")
 }
 
 func (m Model) formatFileInfoOutput(content string, maxHeight, maxWidth int) string {
-	return lipgloss.NewStyle().Foreground(successColor).Render("[ok] file_info")
+	return lipgloss.NewStyle().Foreground(accentColor).Render("> file_info")
 }
 
 func (m Model) formatDefaultToolOutput(content string, maxHeight, maxWidth int) string {
-	lines := strings.Split(content, "\\n")
+	lines := strings.Split(content, "\n")
 	if len(lines) > maxHeight {
 		lines = append(lines[:maxHeight],
 			lipgloss.NewStyle().
@@ -625,7 +583,7 @@ func (m Model) formatDefaultToolOutput(content string, maxHeight, maxWidth int) 
 		}
 	}
 
-	return strings.Join(formattedLines, "\\n")
+	return strings.Join(formattedLines, "\n")
 }
 
 func extractPathFromToolResult(content string) string {
@@ -690,21 +648,23 @@ func (m Model) formatPath(path string) string {
 }
 
 func (m Model) renderStreamingMessage() string {
-	content := strings.TrimSpace(m.streaming)
-	if content == "" {
-		return ""
-	}
+	thinking := strings.TrimSpace(m.thinking)
+	streaming := strings.TrimSpace(m.streaming)
 
 	// If we have thinking content, show it
-	if m.thinking != "" {
-		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6")).Render(" Assistant") +
+	if thinking != "" {
+		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6")).Render("- Assistant") +
 			"\n" +
-			lipgloss.NewStyle().PaddingLeft(4).Width(max(m.width-4, 20)).Render(content)
+			lipgloss.NewStyle().PaddingLeft(4).Width(max(m.width-4, 20)).Render(thinking)
 	}
 
-	return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("5")).Render(" Assistant") +
-		"\n" +
-		lipgloss.NewStyle().PaddingLeft(4).Width(max(m.width-4, 20)).Render(content)
+	if streaming != "" {
+		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("5")).Render("- Assistant") +
+			"\n" +
+			lipgloss.NewStyle().PaddingLeft(4).Width(max(m.width-4, 20)).Render(streaming)
+	}
+
+	return ""
 }
 
 func (m Model) renderSuggestions() string {
@@ -923,6 +883,8 @@ func roleMeta(msg api.Message) (string, lipgloss.Color) {
 		return "You", lipgloss.Color("2")
 	case "assistant":
 		return "Assistant", lipgloss.Color("5")
+	case "tool":
+		return "Tool", lipgloss.Color("3")
 	default:
 		return msg.Role, lipgloss.Color("8")
 	}
