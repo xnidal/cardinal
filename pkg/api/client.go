@@ -177,6 +177,7 @@ type StreamEvent struct {
 	ToolCallWriting bool
 	ToolCallName    string
 	ToolCallArgsLen int
+	Usage           *Usage
 }
 
 func (c *Client) ChatStreamChannel(model string, messages []Message, tools []Tool) <-chan StreamEvent {
@@ -259,6 +260,10 @@ func (c *Client) ChatStreamChannel(model string, messages []Message, tools []Too
 			var chunk StreamChunk
 			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 				continue
+			}
+
+			if chunk.Usage != nil {
+				ch <- StreamEvent{Type: "usage", Usage: chunk.Usage}
 			}
 
 			if len(chunk.Choices) == 0 {

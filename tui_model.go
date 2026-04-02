@@ -5,9 +5,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"cardinal/pkg/api"
 	"cardinal/pkg/config"
+	"cardinal/pkg/storage"
 	"cardinal/pkg/tools"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -49,6 +51,8 @@ type Model struct {
 	historyIndex     int
 	thinkingIdx      int
 	lastStatus       string
+	contextUsed      int
+	contextLimit     int
 }
 
 var slashCommands = []string{
@@ -83,26 +87,28 @@ func NewModel(cfg *config.Config) Model {
 	vp.SetContent("")
 
 	return Model{
-		input:       ti,
-		spinner:     s,
-		client:      api.NewClient(cfg.APIURL, cfg.APIKey),
-		toolDefs:    convertToolDefs(tools.GetToolDefinitions()),
-		working:     working,
-		cfg:         cfg,
-		status:      "Ready",
-		soul:        loadSoul(working),
-		viewport:    vp,
-		autoApprove: false,
+		input:        ti,
+		spinner:      s,
+		client:       api.NewClient(cfg.APIURL, cfg.APIKey),
+		toolDefs:     convertToolDefs(tools.GetToolDefinitions()),
+		working:      working,
+		cfg:          cfg,
+		status:       "Ready",
+		soul:         loadSoul(),
+		viewport:     vp,
+		autoApprove:  false,
+		contextLimit: 128000,
 	}
 }
 
-func loadSoul(working string) string {
-	candidates := []string{filepath.Join(working, "SOUL.md")}
+func loadSoul() string {
+	candidates := []string{storage.GetConfigDir()}
 	if home, err := os.UserHomeDir(); err == nil {
-		candidates = append(candidates, filepath.Join(home, ".cardinal_soul.md"))
+		candidates = append(candidates, filepath.Join(home, ".cardinal"))
 	}
-	for _, p := range candidates {
-		data, err := os.ReadFile(p)
+	for _, dir := range candidates {
+		soulPath := filepath.Join(dir, "SOUL.md")
+		data, err := os.ReadFile(soulPath)
 		if err == nil {
 			if s := strings.TrimSpace(string(data)); s != "" {
 				return s
@@ -116,26 +122,28 @@ func (m Model) Init() tea.Cmd {
 	return textinput.Blink
 }
 
+func startSpinnerTicker() tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
+		return spinner.TickMsg{}
+	})
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.useViewport && m.mode == "" && m.viewport.YOffset >= 0 {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
 			switch msg.Type {
 			case tea.KeyUp:
-				m.viewport.YOffset = max(0, m.viewport.YOffset-3)
+				m.viewport.LineUp(3)
 				return m, nil
 			case tea.KeyDown:
-				if m.viewport.YOffset < m.viewport.YOffset {
-					m.viewport.YOffset = m.viewport.YOffset + 3
-				}
+				m.viewport.LineDown(3)
 				return m, nil
 			case tea.KeyCtrlU:
-				m.viewport.YOffset = max(0, m.viewport.YOffset-15)
+				m.viewport.HalfViewUp()
 				return m, nil
 			case tea.KeyCtrlD:
-				if m.viewport.YOffset < m.viewport.YOffset {
-					m.viewport.YOffset = m.viewport.YOffset + 15
-				}
+				m.viewport.HalfViewDown()
 				return m, nil
 			}
 		case tea.MouseMsg:
@@ -160,6 +168,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = thinkingMessages[m.thinkingIdx]
 		}
 		m.lastStatus = m.status
+		if m.busy {
+			return m, startSpinnerTicker()
+		}
 		return m, nil
 
 	case streamEventMsg:
@@ -281,8 +292,8 @@ func (m Model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.viewport, cmd = m.viewport.Update(msg)
 			return m, cmd
 		}
-		if m.scrollOffset < m.maxScrollOffset() {
-			m.scrollOffset++
+		if m.scrollOffset > 0 {
+			m.scrollOffset--
 		}
 		return m, nil
 
@@ -312,8 +323,8 @@ func (m Model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.viewport, cmd = m.viewport.Update(msg)
 			return m, cmd
 		}
-		if m.scrollOffset > 0 {
-			m.scrollOffset--
+		if m.scrollOffset < len(m.messages) {
+			m.scrollOffset++
 		}
 		return m, nil
 

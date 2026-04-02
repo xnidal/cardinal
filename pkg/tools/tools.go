@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
+	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"cardinal/pkg/storage"
@@ -30,12 +33,14 @@ type ToolCall struct {
 type ToolHandler struct {
 	workingDir string
 	tools      map[string]func(string) ToolResult
+	onEditSoul func()
 }
 
-func NewToolHandler(workingDir string) *ToolHandler {
+func NewToolHandler(workingDir string, onEditSoul func()) *ToolHandler {
 	th := &ToolHandler{
 		workingDir: workingDir,
 		tools:      make(map[string]func(string) ToolResult),
+		onEditSoul: onEditSoul,
 	}
 
 	th.tools["bash"] = th.executeBash
@@ -47,6 +52,7 @@ func NewToolHandler(workingDir string) *ToolHandler {
 	th.tools["glob"] = th.executeGlob
 	th.tools["file_info"] = th.executeFileInfo
 	th.tools["edit_soul"] = th.executeEditSoul
+	th.tools["calculate"] = th.executeCalculate
 	th.tools["todo_add"] = th.executeTodoAdd
 	th.tools["todo_list"] = th.executeTodoList
 	th.tools["todo_update"] = th.executeTodoUpdate
@@ -65,7 +71,7 @@ func (th *ToolHandler) Execute(call ToolCall) ToolResult {
 
 func RequiresApproval(name string) bool {
 	switch name {
-	case "list_files", "read_file", "grep", "glob", "file_info", "edit_soul", "todo_list":
+	case "list_files", "read_file", "grep", "glob", "file_info", "edit_soul", "calculate", "todo_list", "subagent_status", "subagent_list", "subagent_clear":
 		return false
 	default:
 		return true
@@ -84,6 +90,13 @@ func SummarizeCall(name, args string) string {
 		}
 		if err := json.Unmarshal([]byte(args), &params); err == nil && strings.TrimSpace(params.Command) != "" {
 			return "$ " + truncate(params.Command, 60)
+		}
+	case "calculate":
+		var params struct {
+			Expression string `json:"expression"`
+		}
+		if err := json.Unmarshal([]byte(args), &params); err == nil && strings.TrimSpace(params.Expression) != "" {
+			return "= " + params.Expression
 		}
 	case "read_file":
 		var params struct {
@@ -597,6 +610,264 @@ func (th *ToolHandler) executeFileInfo(args string) ToolResult {
 	return ToolResult{Name: "file_info", Success: true, Output: output.String()}
 }
 
+func (th *ToolHandler) executeCalculate(args string) ToolResult {
+	var params struct {
+		Expression string `json:"expression"`
+	}
+
+	if err := json.Unmarshal([]byte(args), &params); err != nil {
+		return ToolResult{Name: "calculate", Success: false, Error: err.Error()}
+	}
+
+	if params.Expression == "" {
+		return ToolResult{Name: "calculate", Success: false, Error: "expression is required"}
+	}
+
+	result := evaluateExpression(params.Expression)
+	return ToolResult{Name: "calculate", Success: true, Output: result}
+}
+
+func evaluateExpression(expr string) string {
+	expr = strings.ReplaceAll(expr, " ", "")
+
+	if expr == "" {
+		return "Error: empty expression"
+	}
+
+	if strings.Contains(expr, "!") {
+		parts := strings.Split(expr, "!")
+		if len(parts) == 2 && parts[1] == "" {
+			n, err := strconv.Atoi(parts[0])
+			if err != nil {
+				return fmt.Sprintf("Error: could not parse '%s' as number", parts[0])
+			}
+			if n < 0 {
+				return "Error: factorial of negative number"
+			}
+			if n > 10000 {
+				return "Error: factorial too large"
+			}
+			return factorial(n).String()
+		}
+	}
+
+	return eval(expr)
+}
+
+func factorial(n int) *big.Int {
+	if n <= 1 {
+		return big.NewInt(1)
+	}
+	result := big.NewInt(1)
+	for i := 2; i <= n; i++ {
+		result.Mul(result, big.NewInt(int64(i)))
+	}
+	return result
+}
+
+func eval(s string) string {
+	s = strings.TrimSpace(s)
+
+	if s == "" {
+		return "Error: empty expression"
+	}
+
+	if strings.ContainsAny(s, "+-*/^()") {
+		return evalComplex(s)
+	}
+
+	n, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return fmt.Sprintf("Error: could not parse '%s' as number", s)
+	}
+
+	return formatNumber(n)
+}
+
+func evalComplex(s string) string {
+	result, err := parseAndEvaluate(s)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
+	return formatNumber(result)
+}
+
+func parseAndEvaluate(s string) (float64, error) {
+	tokens := tokenize(s)
+	if len(tokens) == 0 {
+		return 0, fmt.Errorf("empty expression")
+	}
+
+	pos := 0
+	return parseExpression(tokens, &pos)
+}
+
+func tokenize(s string) []string {
+	var tokens []string
+	var current strings.Builder
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+
+		if c == '(' || c == ')' {
+			if current.Len() > 0 {
+				tokens = append(tokens, current.String())
+				current.Reset()
+			}
+			tokens = append(tokens, string(c))
+			continue
+		}
+
+		if c == '+' || c == '-' || c == '*' || c == '/' || c == '^' {
+			if current.Len() > 0 {
+				tokens = append(tokens, current.String())
+				current.Reset()
+			}
+			tokens = append(tokens, string(c))
+			continue
+		}
+
+		current.WriteByte(c)
+	}
+
+	if current.Len() > 0 {
+		tokens = append(tokens, current.String())
+	}
+
+	return tokens
+}
+
+func parseExpression(tokens []string, pos *int) (float64, error) {
+	if *pos >= len(tokens) {
+		return 0, fmt.Errorf("unexpected end of expression")
+	}
+
+	left, err := parseTerm(tokens, pos)
+	if err != nil {
+		return 0, err
+	}
+
+	for *pos < len(tokens) {
+		op := tokens[*pos]
+		if op != "+" && op != "-" {
+			break
+		}
+		*pos++
+		right, err := parseTerm(tokens, pos)
+		if err != nil {
+			return 0, err
+		}
+		if op == "+" {
+			left += right
+		} else {
+			left -= right
+		}
+	}
+
+	return left, nil
+}
+
+func parseTerm(tokens []string, pos *int) (float64, error) {
+	if *pos >= len(tokens) {
+		return 0, fmt.Errorf("unexpected end of expression")
+	}
+
+	left, err := parsePower(tokens, pos)
+	if err != nil {
+		return 0, err
+	}
+
+	for *pos < len(tokens) {
+		op := tokens[*pos]
+		if op != "*" && op != "/" {
+			break
+		}
+		*pos++
+		right, err := parsePower(tokens, pos)
+		if err != nil {
+			return 0, err
+		}
+		if op == "*" {
+			left *= right
+		} else {
+			if right == 0 {
+				return 0, fmt.Errorf("division by zero")
+			}
+			left /= right
+		}
+	}
+
+	return left, nil
+}
+
+func parsePower(tokens []string, pos *int) (float64, error) {
+	left, err := parseFactor(tokens, pos)
+	if err != nil {
+		return 0, err
+	}
+
+	for *pos < len(tokens) && tokens[*pos] == "^" {
+		*pos++
+		right, err := parseFactor(tokens, pos)
+		if err != nil {
+			return 0, err
+		}
+		left = math.Pow(left, right)
+	}
+
+	return left, nil
+}
+
+func parseFactor(tokens []string, pos *int) (float64, error) {
+	if *pos >= len(tokens) {
+		return 0, fmt.Errorf("unexpected end of expression")
+	}
+
+	token := tokens[*pos]
+
+	if token == "(" {
+		*pos++
+		result, err := parseExpression(tokens, pos)
+		if err != nil {
+			return 0, err
+		}
+		if *pos >= len(tokens) || tokens[*pos] != ")" {
+			return 0, fmt.Errorf("missing closing parenthesis")
+		}
+		*pos++
+		return result, nil
+	}
+
+	*pos++
+	n, err := strconv.ParseFloat(token, 64)
+	if err != nil {
+		return 0, fmt.Errorf("could not parse '%s' as number", token)
+	}
+	return n, nil
+}
+
+func formatNumber(n float64) string {
+	if math.IsInf(n, 1) {
+		return "Infinity"
+	}
+	if math.IsInf(n, -1) {
+		return "-Infinity"
+	}
+	if math.IsNaN(n) {
+		return "NaN"
+	}
+
+	if n == math.Floor(n) && math.Abs(n) < 1e15 {
+		return fmt.Sprintf("%.0f", n)
+	}
+
+	trimmed := strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.10f", n), "0"), ".")
+	if strings.Contains(trimmed, ".") {
+		return trimmed
+	}
+	return fmt.Sprintf("%.10g", n)
+}
+
 func (th *ToolHandler) executeEditSoul(args string) ToolResult {
 	var params struct {
 		Find    string `json:"find"`
@@ -637,6 +908,10 @@ func (th *ToolHandler) executeEditSoul(args string) ToolResult {
 		return ToolResult{Name: "edit_soul", Success: false, Error: err.Error()}
 	}
 
+	if th.onEditSoul != nil {
+		th.onEditSoul()
+	}
+
 	return ToolResult{Name: "edit_soul", Success: true, Output: fmt.Sprintf("Updated SOUL.md in %s", configDir)}
 }
 
@@ -645,7 +920,6 @@ func formatDiff(oldContent, newContent string) string {
 	newLines := strings.Split(newContent, "\n")
 
 	var diff []string
-	diff = append(diff, fmt.Sprintf("success=\"true\" path=\"edit\""))
 
 	for i := 0; i < len(oldLines) || i < len(newLines); i++ {
 		oldLine := ""
@@ -665,6 +939,10 @@ func formatDiff(oldContent, newContent string) string {
 				diff = append(diff, fmt.Sprintf("+%d: %s", i+1, newLine))
 			}
 		}
+	}
+
+	if len(diff) == 0 {
+		return "No changes"
 	}
 
 	return strings.Join(diff, "\n")
@@ -716,21 +994,24 @@ func (th *ToolHandler) resolvePath(path string) (string, error) {
 
 func FormatToolResult(result ToolResult) string {
 	var output strings.Builder
-	output.WriteString(fmt.Sprintf("<tool_result name=\"%s\" success=\"%v\"", result.Name, result.Success))
+	if result.Success {
+		output.WriteString(fmt.Sprintf("[%s]\n", result.Name))
+	} else {
+		output.WriteString(fmt.Sprintf("[%s] Error: ", result.Name))
+	}
 	if result.Path != "" {
-		output.WriteString(fmt.Sprintf(" path=\"%s\"", result.Path))
+		output.WriteString(fmt.Sprintf("%s", result.Path))
+		if result.Lines != "" {
+			output.WriteString(fmt.Sprintf(" (%s)", result.Lines))
+		}
+		output.WriteString("\n")
 	}
-	if result.Lines != "" {
-		output.WriteString(fmt.Sprintf(" lines=\"%s\"", result.Lines))
-	}
-	output.WriteString(">\n")
 	if result.Output != "" {
-		output.WriteString(result.Output + "\n")
+		output.WriteString(result.Output)
 	}
 	if result.Error != "" {
-		output.WriteString(fmt.Sprintf("Error: %s\n", result.Error))
+		output.WriteString(result.Error)
 	}
-	output.WriteString("</tool_result>")
 	return output.String()
 }
 
@@ -852,6 +1133,20 @@ func GetToolDefinitions() []interface{} {
 						"path": map[string]interface{}{"type": "string", "description": "The file or directory path"},
 					},
 					"required": []string{"path"},
+				},
+			},
+		},
+		map[string]interface{}{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        "calculate",
+				"description": "Evaluate a mathematical expression with 100% certainty. Supports +, -, *, /, ^ (power), ! (factorial), and parentheses.",
+				"parameters": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"expression": map[string]interface{}{"type": "string", "description": "Mathematical expression to evaluate (e.g., '2 + 2', '(5 * 3) / 2', '2^10', '5!')"},
+					},
+					"required": []string{"expression"},
 				},
 			},
 		},

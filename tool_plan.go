@@ -22,8 +22,8 @@ func hasPendingApprovals(toolCalls []api.ToolCall) bool {
 	return false
 }
 
-func executeToolPlan(working string, toolCalls []api.ToolCall, approvals []bool) []tools.ToolResult {
-	handler := tools.NewToolHandler(working)
+func executeToolPlan(working string, toolCalls []api.ToolCall, approvals []bool, onEditSoul func()) []tools.ToolResult {
+	handler := tools.NewToolHandler(working, onEditSoul)
 	results := make([]tools.ToolResult, 0, len(toolCalls))
 
 	for i, toolCall := range toolCalls {

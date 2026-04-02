@@ -112,7 +112,89 @@ func calculateBackoff(attempt int) time.Duration {
 func (m Model) buildMessages() []api.Message {
 	systemPrompt := m.getSystemPrompt()
 	messages := append([]api.Message{{Role: "system", Content: systemPrompt}}, m.messages...)
+	messages = m.compressMessages(messages)
 	return messages
+}
+
+func (m Model) estimateTokens(messages []api.Message) int {
+	total := 0
+	for _, msg := range messages {
+		total += len(msg.Content) / 4
+		total += len(msg.Role) / 4
+		for _, tc := range msg.ToolCalls {
+			total += len(tc.Function.Name) / 4
+			total += len(tc.Function.Arguments) / 4
+		}
+		total += 10
+	}
+	return total
+}
+
+func (m Model) compressMessages(messages []api.Message) []api.Message {
+	contextLimit := m.contextLimit
+	if contextLimit == 0 {
+		contextLimit = 128000
+	}
+
+	currentTokens := m.estimateTokens(messages)
+	threshold := int(float64(contextLimit) * 0.7)
+
+	if currentTokens < threshold {
+		return messages
+	}
+
+	for {
+		compressed := m.doCompress(messages)
+		newTokens := m.estimateTokens(compressed)
+
+		if newTokens < threshold || newTokens >= currentTokens {
+			break
+		}
+
+		messages = compressed
+		currentTokens = newTokens
+	}
+
+	return messages
+}
+
+func (m Model) doCompress(messages []api.Message) []api.Message {
+	if len(messages) <= 4 {
+		return messages
+	}
+
+	keepRecent := 4
+	summaryEnd := len(messages) - keepRecent
+
+	if summaryEnd <= 1 {
+		return messages
+	}
+
+	var summary strings.Builder
+	summary.WriteString("Previous conversation summary:\n")
+
+	for i := 1; i < summaryEnd; i++ {
+		msg := messages[i]
+		content := msg.Content
+		if len(content) > 100 {
+			content = content[:100] + "..."
+		}
+		content = strings.ReplaceAll(content, "\n", " ")
+
+		if msg.Role == "tool" {
+			summary.WriteString(fmt.Sprintf("- %s: %s\n", msg.Role, msg.Name))
+		} else {
+			summary.WriteString(fmt.Sprintf("- %s: %s\n", msg.Role, content))
+		}
+	}
+
+	compressed := []api.Message{
+		messages[0],
+		{Role: "system", Content: summary.String()},
+	}
+	compressed = append(compressed, messages[summaryEnd:]...)
+
+	return compressed
 }
 
 func (m Model) getSystemPrompt() string {
@@ -133,7 +215,7 @@ func (m Model) beginStream() (tea.Model, tea.Cmd) {
 	m.err = nil
 	m.status = thinkingMessages[0]
 	m.thinkingIdx = 0
-	return m, tea.Batch(waitForStreamEvent(m.streamCh), m.spinner.Tick)
+	return m, tea.Batch(waitForStreamEvent(m.streamCh), startSpinnerTicker())
 }
 
 func (m Model) handleStreamEvent(event api.StreamEvent) (tea.Model, tea.Cmd) {
@@ -161,6 +243,12 @@ func (m Model) handleStreamEvent(event api.StreamEvent) (tea.Model, tea.Cmd) {
 		if event.Tool != nil {
 			m.pendingToolCalls = append(m.pendingToolCalls, *event.Tool)
 			m.status = "Review tool permissions"
+		}
+		return m, waitForStreamEvent(m.streamCh)
+
+	case "usage":
+		if event.Usage != nil {
+			m.contextUsed = event.Usage.PromptTokens
 		}
 		return m, waitForStreamEvent(m.streamCh)
 
@@ -360,8 +448,12 @@ func (m Model) executeToolPlanCmd(assistantContent string, toolCalls []api.ToolC
 	toolCallsCopy := append([]api.ToolCall(nil), toolCalls...)
 	approvalsCopy := append([]bool(nil), approvals...)
 
+	onEditSoul := func() {
+		m.soul = loadSoul()
+	}
+
 	return func() tea.Msg {
-		results := executeToolPlan(working, toolCallsCopy, approvalsCopy)
+		results := executeToolPlan(working, toolCallsCopy, approvalsCopy, onEditSoul)
 		return toolExecutionMsg{
 			assistantContent: assistantContent,
 			toolCalls:        toolCallsCopy,
