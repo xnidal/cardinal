@@ -3,6 +3,7 @@ package tools
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -11,21 +12,21 @@ var SubAgentModels = map[string]ModelProfile{
 	"fast": {
 		Name:        "fast",
 		Description: "Fast, lightweight model for quick tasks like codebase exploration, simple queries, and formatting",
-		Model:       "", // Will use default from config if empty
+		Model:       "openai/gpt-oss-120b",
 		MaxTokens:   2048,
 		Temperature: 0.3,
 	},
 	"smart": {
 		Name:        "smart",
 		Description: "Capable model for complex reasoning, analysis, and multi-step tasks",
-		Model:       "", // Will use default from config if empty
+		Model:       "z-ai/glm5",
 		MaxTokens:   4096,
 		Temperature: 0.7,
 	},
 	"tiny": {
 		Name:        "tiny",
 		Description: "Smallest, fastest model for trivial tasks",
-		Model:       "",
+		Model:       "openai/gpt-oss-20b",
 		MaxTokens:   1024,
 		Temperature: 0.2,
 	},
@@ -41,13 +42,20 @@ type ModelProfile struct {
 
 // SubAgentTask represents a task to be executed by a sub-agent
 type SubAgentTask struct {
-	ID          string `json:"id"`
-	Profile     string `json:"profile"`
-	Prompt      string `json:"prompt"`
-	SystemAddOn string `json:"system_add_on,omitempty"`
-	Status      string `json:"status"` // pending, running, completed, failed
-	Result      string `json:"result,omitempty"`
-	Error       string `json:"error,omitempty"`
+	ID          string        `json:"id"`
+	Profile     string        `json:"profile"`
+	Prompt      string        `json:"prompt"`
+	SystemAddOn string        `json:"system_add_on,omitempty"`
+	Status      string        `json:"status"` // pending, running, completed, failed
+	Result      string        `json:"result,omitempty"`
+	Error       string        `json:"error,omitempty"`
+	History     []SubAgentMsg `json:"history,omitempty"`
+}
+
+type SubAgentMsg struct {
+	Type    string `json:"type"` // thinking, message, tool_call, tool_result
+	Content string `json:"content"`
+	Name    string `json:"name,omitempty"` // for tool calls
 }
 
 // SubAgentManager manages concurrent sub-agent tasks
@@ -88,6 +96,27 @@ func (m *SubAgentManager) GetTask(id string) *SubAgentTask {
 	return m.tasks[id]
 }
 
+func (m *SubAgentManager) GetOrCreateTask(profile, prompt, systemAddOn string) *SubAgentTask {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, task := range m.tasks {
+		if task.Profile == profile && task.Prompt == prompt && task.Status == "pending" {
+			return task
+		}
+	}
+	id := fmt.Sprintf("task_%d", len(m.tasks)+1)
+	task := &SubAgentTask{
+		ID:          id,
+		Profile:     profile,
+		Prompt:      prompt,
+		SystemAddOn: systemAddOn,
+		Status:      "pending",
+	}
+	m.tasks[id] = task
+	m.taskOrder = append(m.taskOrder, id)
+	return task
+}
+
 func (m *SubAgentManager) UpdateTask(id string, status, result, errMsg string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -98,6 +127,54 @@ func (m *SubAgentManager) UpdateTask(id string, status, result, errMsg string) {
 		}
 		if errMsg != "" {
 			task.Error = errMsg
+		}
+	}
+}
+
+func (m *SubAgentManager) AddHistoryMsg(id string, msgType, content, name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if task, ok := m.tasks[id]; ok {
+		task.History = append(task.History, SubAgentMsg{
+			Type:    msgType,
+			Content: content,
+			Name:    name,
+		})
+	}
+}
+
+func (m *SubAgentManager) GetPendingTasks() []*SubAgentTask {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var pending []*SubAgentTask
+	for _, id := range m.taskOrder {
+		if task, ok := m.tasks[id]; ok && task.Status == "pending" {
+			pending = append(pending, task)
+		}
+	}
+	return pending
+}
+
+func (m *SubAgentManager) StartTask(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if task, ok := m.tasks[id]; ok && task.Status == "pending" {
+		task.Status = "running"
+		return true
+	}
+	return false
+}
+
+func (m *SubAgentManager) CompleteTask(id, result, errMsg string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if task, ok := m.tasks[id]; ok {
+		if errMsg != "" {
+			task.Status = "failed"
+			task.Error = errMsg
+		} else {
+			task.Status = "completed"
+			task.Result = result
 		}
 	}
 }
@@ -141,23 +218,36 @@ func GetAvailableProfiles() []ModelProfile {
 
 // Tool result formatting for subagent tools
 func formatSubAgentTaskResult(task *SubAgentTask) string {
-	result := fmt.Sprintf("<subagent_task id=\"%s\" profile=\"%s\" status=\"%s\">\n",
-		task.ID, task.Profile, task.Status)
+	var result strings.Builder
+	result.WriteString(fmt.Sprintf("<subagent_task id=\"%s\" profile=\"%s\" status=\"%s\">\n",
+		task.ID, task.Profile, task.Status))
 	if task.Prompt != "" {
 		truncated := task.Prompt
 		if len(truncated) > 100 {
 			truncated = truncated[:100] + "..."
 		}
-		result += fmt.Sprintf("  <prompt>%s</prompt>\n", truncated)
+		result.WriteString(fmt.Sprintf("  <prompt>%s</prompt>\n", truncated))
+	}
+	for _, msg := range task.History {
+		switch msg.Type {
+		case "thinking":
+			result.WriteString(fmt.Sprintf("  <thinking>%s</thinking>\n", msg.Content))
+		case "message":
+			result.WriteString(fmt.Sprintf("  <message role=\"%s\">%s</message>\n", msg.Name, msg.Content))
+		case "tool_call":
+			result.WriteString(fmt.Sprintf("  <tool_call name=\"%s\">%s</tool_call>\n", msg.Name, msg.Content))
+		case "tool_result":
+			result.WriteString(fmt.Sprintf("  <tool_result name=\"%s\">%s</tool_result>\n", msg.Name, msg.Content))
+		}
 	}
 	if task.Result != "" {
-		result += fmt.Sprintf("  <result>%s</result>\n", task.Result)
+		result.WriteString(fmt.Sprintf("  <result>%s</result>\n", task.Result))
 	}
 	if task.Error != "" {
-		result += fmt.Sprintf("  <error>%s</error>\n", task.Error)
+		result.WriteString(fmt.Sprintf("  <error>%s</error>\n", task.Error))
 	}
-	result += "</subagent_task>"
-	return result
+	result.WriteString("</subagent_task>")
+	return result.String()
 }
 
 func (th *ToolHandler) executeSubAgent(args string) ToolResult {
@@ -235,15 +325,16 @@ func (th *ToolHandler) executeSubAgentList(args string) ToolResult {
 		}
 	}
 
-	output := fmt.Sprintf("Active sub-agent tasks (%d):\n", len(tasks))
+	var output strings.Builder
+	fmt.Fprintf(&output, "Active sub-agent tasks (%d):\n", len(tasks))
 	for _, task := range tasks {
-		output += fmt.Sprintf("- %s [%s]: %s\n", task.ID, task.Profile, task.Status)
+		fmt.Fprintf(&output, "> %s [%s]: %s\n", task.ID, task.Profile, task.Status)
 	}
 
 	return ToolResult{
 		Name:    "subagent_list",
 		Success: true,
-		Output:  output,
+		Output:  output.String(),
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"cardinal/pkg/api"
@@ -108,18 +109,11 @@ func (m Model) renderThrobber() string {
 
 	color := getStatusColor(status)
 	throbberStyle := lipgloss.NewStyle().Foreground(color).Bold(true)
-	statusStyle := lipgloss.NewStyle().Foreground(color)
 
-	spinner := throbberStyle.Render("[ " + m.spinner.View() + " ]")
-	statusText := statusStyle.Render(status)
+	spinner := throbberStyle.Render(m.spinner.View())
+	statusText := lipgloss.NewStyle().Foreground(color).Render(status)
 
-	box := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(color).
-		Padding(0, 2).
-		Render(spinner + " " + statusText)
-
-	return box
+	return spinner + " " + statusText
 }
 
 func getStatusColor(status string) lipgloss.Color {
@@ -129,7 +123,7 @@ func getStatusColor(status string) lipgloss.Color {
 		return lipgloss.Color("81")
 	case strings.Contains(lower, "receiving") || strings.Contains(lower, "writing"):
 		return lipgloss.Color("177")
-	case strings.Contains(lower, "running") || strings.Contains(lower, "tools") || strings.Contains(lower, "continu"):
+	case strings.Contains(lower, "running") || strings.Contains(lower, "continu"):
 		return lipgloss.Color("215")
 	case strings.Contains(lower, "error") || strings.Contains(lower, "fail") || strings.Contains(lower, "denied"):
 		return lipgloss.Color("196")
@@ -160,28 +154,8 @@ func (m Model) renderMode() string {
 }
 
 func (m Model) renderHeader() string {
-	status := m.status
-	if status == "" {
-		status = "Ready"
-	}
-
-	statusColor := getStatusColor(status)
-
-	var statusText string
-	if m.autoApprove {
-		statusText = lipgloss.NewStyle().
-			Foreground(statusColor).
-			Bold(true).
-			Render("[ " + status + " ] auto-approve")
-	} else {
-		statusText = lipgloss.NewStyle().
-			Foreground(statusColor).
-			Bold(true).
-			Render("[ " + status + " ]")
-	}
-
 	info := subtitleStyle.Render(
-		"  " + m.cfg.ActiveProfileName() + " > " + m.cfg.Model + " @ " + compactEndpoint(m.cfg.APIURL),
+		" " + m.cfg.ActiveProfileName() + " > " + m.cfg.Model + " @ " + compactEndpoint(m.cfg.APIURL),
 	)
 
 	title := lipgloss.NewStyle().
@@ -191,13 +165,7 @@ func (m Model) renderHeader() string {
 
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
-		lipgloss.NewStyle().MarginBottom(1).Render(
-			lipgloss.JoinHorizontal(
-				lipgloss.Top,
-				title,
-				lipgloss.NewStyle().PaddingLeft(2).Render(statusText),
-			),
-		),
+		lipgloss.NewStyle().MarginBottom(1).Render(title),
 		info,
 		"",
 	)
@@ -211,23 +179,33 @@ func (m Model) renderConversation() string {
 		return m.renderWelcome()
 	}
 
+	return m.renderChatHistory(m.messages, m.scrollOffset, hasStreaming, hasThinking, m.err)
+}
+
+func (m Model) renderChatHistory(messages []api.Message, scrollOffset int, hasStreaming, hasThinking bool, chatErr error) string {
+	if len(messages) == 0 && !hasStreaming && !hasThinking && chatErr == nil {
+		return m.renderWelcome()
+	}
+
 	var blocks []string
 
-	if m.scrollOffset > 0 {
+	if scrollOffset > 0 {
 		blocks = append(blocks,
 			lipgloss.NewStyle().
 				Foreground(dimColor).
 				Italic(true).
-				Render("↑ "+fmt.Sprintf("%d older message%s", m.scrollOffset, pluralize(m.scrollOffset))),
+				Render("↑ "+fmt.Sprintf("%d older message%s", scrollOffset, pluralize(scrollOffset))),
 		)
 	}
 
-	visible := m.getVisibleMessages()
+	visible := messages
+	if scrollOffset > 0 && scrollOffset < len(messages) {
+		visible = messages[scrollOffset:]
+	}
 	for i, message := range visible {
 		if rendered := m.renderMessage(message); rendered != "" {
 			blocks = append(blocks, rendered)
 		}
-		// Add blank line between messages (not after last)
 		if i < len(visible)-1 {
 			blocks = append(blocks, "")
 		}
@@ -237,12 +215,12 @@ func (m Model) renderConversation() string {
 		blocks = append(blocks, m.renderStreamingMessage())
 	}
 
-	if m.err != nil {
+	if chatErr != nil {
 		errorBox := lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(errorColor).
 			Padding(0, 1).
-			Render("⚠ Error: " + m.err.Error())
+			Render("⚠ Error: " + chatErr.Error())
 		blocks = append(blocks, errorBox)
 	}
 
@@ -301,12 +279,7 @@ func (m Model) renderMessage(msg api.Message) string {
 		return ""
 	}
 
-	var icon string
-	if msg.Role == "user" {
-		icon = ">"
-	} else {
-		icon = "-"
-	}
+	var icon string = ">"
 
 	labelLine := lipgloss.NewStyle().
 		Bold(true).
@@ -359,9 +332,42 @@ func (m Model) renderToolResult(msg api.Message) string {
 	case "list_files":
 		path := extractPathFromToolResult(msg.Content)
 		displayPath := m.formatPath(path)
-		content = lipgloss.NewStyle().
+		if displayPath == "" {
+			displayPath = "."
+		}
+
+		lines := strings.Split(msg.Content, "\n")
+		if len(lines) > maxHeight {
+			lines = append(lines[:maxHeight],
+				lipgloss.NewStyle().
+					Foreground(warningColor).
+					Italic(true).
+					Render(fmt.Sprintf("  ... %d more results", len(lines)-maxHeight)),
+			)
+		}
+
+		var formattedLines []string
+		for _, line := range lines {
+			if len(line) > maxWidth {
+				line = line[:maxWidth-3] + "..."
+			}
+			if strings.TrimSpace(line) != "" {
+				formattedLines = append(formattedLines, line)
+			}
+		}
+
+		header := lipgloss.NewStyle().
 			Foreground(accentColor).
-			Render("> list " + displayPath)
+			Render("> list_files " + displayPath)
+
+		outputBox := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(dimColor).
+			Padding(0, 1).
+			Width(maxWidth).
+			Render(strings.Join(formattedLines, "\n"))
+
+		content = header + "\n" + outputBox
 
 	case "bash":
 		content = m.formatBashOutput(msg.Content, maxHeight, maxWidth)
@@ -389,6 +395,9 @@ func (m Model) renderToolResult(msg api.Message) string {
 	case "calculate":
 		content = m.formatCalculateOutput(msg.Content, maxHeight, maxWidth)
 
+	case "subagent", "subagent_status", "subagent_list", "subagent_clear":
+		content = m.formatSubagentOutput(msg.Content, maxHeight, maxWidth)
+
 	default:
 		content = m.formatDefaultToolOutput(msg.Content, maxHeight, maxWidth)
 	}
@@ -410,22 +419,27 @@ func (m Model) formatBashOutput(content string, maxHeight, maxWidth int) string 
 	}
 
 	var formattedLines []string
-	formattedLines = append(formattedLines,
-		lipgloss.NewStyle().Foreground(accentColor).Render("> bash:"),
-	)
-
 	for _, line := range lines {
 		if len(line) > maxWidth {
 			line = line[:maxWidth-3] + "..."
 		}
 		if strings.TrimSpace(line) != "" {
-			formattedLines = append(formattedLines,
-				lipgloss.NewStyle().Foreground(dimColor).Render("    "+line),
-			)
+			formattedLines = append(formattedLines, line)
 		}
 	}
 
-	return strings.Join(formattedLines, "\n")
+	header := lipgloss.NewStyle().
+		Foreground(accentColor).
+		Render("> bash")
+
+	outputBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(dimColor).
+		Padding(0, 1).
+		Width(maxWidth).
+		Render(strings.Join(formattedLines, "\n"))
+
+	return header + "\n" + outputBox
 }
 
 func (m Model) formatWriteFileOutput(content string, maxHeight, maxWidth int) string {
@@ -497,63 +511,89 @@ func (m Model) formatEditFileOutput(content string, maxHeight, maxWidth int) str
 }
 
 func (m Model) formatGrepOutput(content string, maxHeight, maxWidth int) string {
-	lines := strings.Split(content, "\\n")
-	if len(lines) > maxHeight {
-		lines = append(lines[:maxHeight],
-			lipgloss.NewStyle().
-				Foreground(warningColor).
-				Italic(true).
-				Render(fmt.Sprintf("  ... %d more lines", len(lines)-maxHeight)),
-		)
+	lines := strings.Split(content, "\n")
+
+	// Extract pattern from first line if it's a summary
+	var pattern string
+	if len(lines) > 0 && !strings.HasPrefix(lines[0], "===") && !strings.HasPrefix(lines[0], "---") {
+		pattern = strings.TrimSpace(lines[0])
+		lines = lines[1:]
 	}
 
-	var formattedLines []string
-	formattedLines = append(formattedLines,
-		lipgloss.NewStyle().Foreground(accentColor).Render("> grep:"),
-	)
-
+	// Count actual matches
+	matchCount := 0
 	for _, line := range lines {
-		if len(line) > maxWidth {
-			line = line[:maxWidth-3] + "..."
-		}
-		if strings.TrimSpace(line) != "" {
-			formattedLines = append(formattedLines,
-				lipgloss.NewStyle().Foreground(dimColor).Render("    "+line),
-			)
+		if strings.HasPrefix(line, "> ") {
+			matchCount++
 		}
 	}
 
-	return strings.Join(formattedLines, "\n")
+	// Build header with pattern and count
+	headerText := "* Grep"
+	if pattern != "" {
+		headerText = "* Grep \"" + pattern + "\""
+	}
+	if matchCount > 0 {
+		headerText += fmt.Sprintf(" (%d match%s)", matchCount, pluralize(matchCount))
+	}
+
+	return lipgloss.NewStyle().
+		Foreground(accentColor).
+		Render(headerText)
 }
 
 func (m Model) formatGlobOutput(content string, maxHeight, maxWidth int) string {
+	path := extractPathFromToolResult(content)
+	displayPath := m.formatPath(path)
+	if displayPath == "" {
+		displayPath = "."
+	}
+
 	lines := strings.Split(content, "\n")
-	if len(lines) > maxHeight {
-		lines = append(lines[:maxHeight],
+	var files []string
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			files = append(files, line)
+		}
+	}
+
+	if len(files) > maxHeight {
+		files = append(files[:maxHeight],
 			lipgloss.NewStyle().
 				Foreground(warningColor).
 				Italic(true).
-				Render(fmt.Sprintf("  ... %d more results", len(lines)-maxHeight)),
+				Render(fmt.Sprintf(" ... %d more results", len(files)-maxHeight)),
 		)
 	}
 
 	var formattedLines []string
-	formattedLines = append(formattedLines,
-		lipgloss.NewStyle().Foreground(accentColor).Render("> glob:"),
-	)
-
-	for _, line := range lines {
-		if len(line) > maxWidth {
-			line = line[:maxWidth-3] + "..."
+	for _, line := range files {
+		if len(line) > maxWidth-4 {
+			line = line[:maxWidth-7] + "..."
 		}
-		if strings.TrimSpace(line) != "" {
-			formattedLines = append(formattedLines,
-				lipgloss.NewStyle().Foreground(dimColor).Render("    "+line),
-			)
-		}
+		formattedLines = append(formattedLines,
+			lipgloss.NewStyle().
+				Foreground(dimColor).
+				Render("  "+line),
+		)
 	}
 
-	return strings.Join(formattedLines, "\n")
+	header := lipgloss.NewStyle().
+		Foreground(accentColor).
+		Render(fmt.Sprintf("* Glob \"%s\" (%d result%s)", displayPath, len(files), pluralize(len(files))))
+
+	if len(formattedLines) == 0 {
+		return header
+	}
+
+	outputBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(dimColor).
+		Padding(0, 1).
+		Width(maxWidth).
+		Render(strings.Join(formattedLines, "\n"))
+
+	return header + "\n" + outputBox
 }
 
 func (m Model) formatFileInfoOutput(content string, maxHeight, maxWidth int) string {
@@ -586,8 +626,152 @@ func (m Model) formatDefaultToolOutput(content string, maxHeight, maxWidth int) 
 	return strings.Join(formattedLines, "\n")
 }
 
+func (m Model) formatSubagentOutput(content string, maxHeight, maxWidth int) string {
+	re := regexp.MustCompile(`<subagent_task id="([^"]*)" profile="([^"]*)" status="([^"]*)">`)
+	matches := re.FindStringSubmatch(content)
+
+	var taskID, profile, status string
+	if len(matches) >= 4 {
+		taskID = matches[1]
+		profile = matches[2]
+		status = matches[3]
+	}
+
+	headerStyle := lipgloss.NewStyle().
+		Foreground(accentColor).
+		Bold(true)
+
+	statusColor := successColor
+	if status == "running" {
+		statusColor = warningColor
+	} else if status == "failed" {
+		statusColor = errorColor
+	}
+
+	header := headerStyle.Render("> subagent") + " " +
+		lipgloss.NewStyle().Foreground(dimColor).Render(taskID) + " " +
+		lipgloss.NewStyle().Foreground(statusColor).Render("["+status+"]") + " " +
+		lipgloss.NewStyle().Foreground(accentColor).Render(profile)
+
+	var bodyLines []string
+	rePrompt := regexp.MustCompile(`<prompt>([^<]*)</prompt>`)
+	reThinking := regexp.MustCompile(`<thinking>([^<]*)</thinking>`)
+	reMessage := regexp.MustCompile(`<message role="([^"]*)">([^<]*)</message>`)
+	reToolCall := regexp.MustCompile(`<tool_call name="([^"]*)">([^<]*)</tool_call>`)
+	reToolResult := regexp.MustCompile(`<tool_result name="([^"]*)">([^<]*)</tool_result>`)
+	reResult := regexp.MustCompile(`<result>([^<]*)</result>`)
+	reError := regexp.MustCompile(`<error>([^<]*)</error>`)
+
+	if promptMatch := rePrompt.FindStringSubmatch(content); len(promptMatch) >= 2 {
+		bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(accentColor).Bold(true).Render("  ▼ Prompt"))
+		truncated := promptMatch[1]
+		if len(truncated) > maxWidth-4 {
+			truncated = truncated[:maxWidth-7] + "..."
+		}
+		bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(dimColor).Render("    "+truncated))
+	}
+
+	for _, match := range reThinking.FindAllStringSubmatch(content, -1) {
+		if len(match) >= 2 {
+			thinking := match[1]
+			if len(thinking) > maxWidth-4 {
+				thinking = thinking[:maxWidth-7] + "..."
+			}
+			bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Render("  ◍ thinking"))
+			bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Italic(true).Render("    "+thinking))
+		}
+	}
+
+	for _, match := range reMessage.FindAllStringSubmatch(content, -1) {
+		if len(match) >= 3 {
+			role := match[1]
+			msgContent := match[2]
+			if len(msgContent) > maxWidth-4 {
+				msgContent = msgContent[:maxWidth-7] + "..."
+			}
+			roleColor := successColor
+			if role == "user" {
+				roleColor = accentColor
+			}
+			bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(roleColor).Render("  > "+role))
+			bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(dimColor).Render("    "+msgContent))
+		}
+	}
+
+	for _, match := range reToolCall.FindAllStringSubmatch(content, -1) {
+		if len(match) >= 3 {
+			toolName := match[1]
+			toolArgs := match[2]
+			if len(toolArgs) > maxWidth-4 {
+				toolArgs = toolArgs[:maxWidth-7] + "..."
+			}
+			bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(warningColor).Render("  ◉ tool: "+toolName))
+			bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(dimColor).Render("    "+toolArgs))
+		}
+	}
+
+	for _, match := range reToolResult.FindAllStringSubmatch(content, -1) {
+		if len(match) >= 3 {
+			toolName := match[1]
+			toolResult := match[2]
+			if len(toolResult) > maxWidth-4 {
+				toolResult = toolResult[:maxWidth-7] + "..."
+			}
+			bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(successColor).Render("  ◉ result: "+toolName))
+			bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(dimColor).Render("    "+toolResult))
+		}
+	}
+
+	if resultMatch := reResult.FindStringSubmatch(content); len(resultMatch) >= 2 {
+		result := resultMatch[1]
+		resultLines := strings.Split(result, "\n")
+		for i, line := range resultLines {
+			if len(line) > maxWidth-4 {
+				line = line[:maxWidth-7] + "..."
+			}
+			if i == 0 {
+				bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(successColor).Bold(true).Render("  ✓ Result"))
+			}
+			bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(dimColor).Render("    "+line))
+		}
+	}
+
+	if errorMatch := reError.FindStringSubmatch(content); len(errorMatch) >= 2 {
+		bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(errorColor).Bold(true).Render("  ✕ Error"))
+		bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(errorColor).Render("    "+errorMatch[1]))
+	}
+
+	if len(bodyLines) > maxHeight {
+		keepCount := maxHeight - 1
+		truncLine := lipgloss.NewStyle().
+			Foreground(warningColor).
+			Italic(true).
+			Render(fmt.Sprintf("  ... %d more lines", len(bodyLines)-keepCount))
+		bodyLines = append([]string{truncLine}, bodyLines[len(bodyLines)-keepCount:]...)
+	}
+
+	var formattedBody []string
+	for _, line := range bodyLines {
+		formattedBody = append(formattedBody, line)
+	}
+
+	boxStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(dimColor).
+		Padding(0, 1).
+		Width(maxWidth)
+
+	return header + "\n" + boxStyle.Render(strings.Join(formattedBody, "\n"))
+}
+
 func extractPathFromToolResult(content string) string {
 	lines := strings.Split(content, "\n")
+	if len(lines) >= 2 {
+		pathLine := strings.TrimSpace(lines[1])
+		if pathLine != "" && !strings.HasPrefix(pathLine, "[") && !strings.HasPrefix(pathLine, "Error:") {
+			return pathLine
+		}
+	}
 	for _, line := range lines {
 		if strings.HasPrefix(line, "[") {
 			parts := strings.SplitN(line, " ", 2)
@@ -653,13 +837,13 @@ func (m Model) renderStreamingMessage() string {
 
 	// If we have thinking content, show it
 	if thinking != "" {
-		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6")).Render("- Assistant") +
+		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6")).Render("> Cardinal [thinking]") +
 			"\n" +
 			lipgloss.NewStyle().PaddingLeft(4).Width(max(m.width-4, 20)).Render(thinking)
 	}
 
 	if streaming != "" {
-		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("5")).Render("- Assistant") +
+		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("5")).Render("> Cardinal [streaming]") +
 			"\n" +
 			lipgloss.NewStyle().PaddingLeft(4).Width(max(m.width-4, 20)).Render(streaming)
 	}
@@ -882,7 +1066,7 @@ func roleMeta(msg api.Message) (string, lipgloss.Color) {
 	case "user":
 		return "You", lipgloss.Color("2")
 	case "assistant":
-		return "Assistant", lipgloss.Color("5")
+		return "Cardinal", lipgloss.Color("5")
 	case "tool":
 		return "Tool", lipgloss.Color("3")
 	default:
@@ -903,11 +1087,4 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen-3] + "..."
-}
-
-func (m Model) getVisibleMessages() []api.Message {
-	if m.scrollOffset >= len(m.messages) {
-		return nil
-	}
-	return m.messages[m.scrollOffset:]
 }

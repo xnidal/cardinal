@@ -15,7 +15,7 @@ import (
 	"cardinal/pkg/tools"
 )
 
-func convertToolDefs(defs []interface{}) []api.Tool {
+func convertToolDefs(defs []any) []api.Tool {
 	var result []api.Tool
 	for _, def := range defs {
 		data, _ := json.Marshal(def)
@@ -115,13 +115,12 @@ func runCLI(cfg *config.Config, prompt string) {
 		})
 
 		for i, toolCall := range toolCalls {
-			fmt.Printf("\n[Tool: %s]\n", toolCall.Function.Name)
-			formatted := tools.FormatToolResult(results[i])
+			formatted := tools.FormatToolResultCLI(results[i], toolCall.Function.Name, toolCall.Function.Arguments)
 			fmt.Println(formatted)
 			messages = append(messages, api.Message{
 				Role:    "tool",
 				Name:    toolCall.Function.Name,
-				Content: formatted,
+				Content: tools.FormatToolResult(results[i]),
 			})
 		}
 
@@ -174,9 +173,9 @@ func compressMessagesCLI(messages []api.Message) []api.Message {
 		content = strings.ReplaceAll(content, "\n", " ")
 
 		if msg.Role == "tool" {
-			summary.WriteString(fmt.Sprintf("- %s: %s\n", msg.Role, msg.Name))
+			summary.WriteString(fmt.Sprintf("> %s: %s\n", msg.Role, msg.Name))
 		} else {
-			summary.WriteString(fmt.Sprintf("- %s: %s\n", msg.Role, content))
+			summary.WriteString(fmt.Sprintf("> %s: %s\n", msg.Role, content))
 		}
 	}
 

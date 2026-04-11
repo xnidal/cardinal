@@ -182,9 +182,9 @@ func (m Model) doCompress(messages []api.Message) []api.Message {
 		content = strings.ReplaceAll(content, "\n", " ")
 
 		if msg.Role == "tool" {
-			summary.WriteString(fmt.Sprintf("- %s: %s\n", msg.Role, msg.Name))
+			summary.WriteString(fmt.Sprintf("> %s: %s\n", msg.Role, msg.Name))
 		} else {
-			summary.WriteString(fmt.Sprintf("- %s: %s\n", msg.Role, content))
+			summary.WriteString(fmt.Sprintf("> %s: %s\n", msg.Role, content))
 		}
 	}
 
@@ -218,33 +218,41 @@ func (m Model) beginStream() (tea.Model, tea.Cmd) {
 	return m, tea.Batch(waitForStreamEvent(m.streamCh), startSpinnerTicker())
 }
 
+func (m *Model) setStatus(newStatus string) {
+	if m.errorStatus != "" && time.Since(m.errorStatusTime) < 3*time.Second {
+		return
+	}
+	m.errorStatus = ""
+	m.status = newStatus
+}
+
 func (m Model) handleStreamEvent(event api.StreamEvent) (tea.Model, tea.Cmd) {
 	switch event.Type {
 	case "content":
 		m.streaming += event.Content
-		m.status = "Receiving response"
+		m.setStatus("Receiving response")
 		m.retryCount = 0
 		return m, waitForStreamEvent(m.streamCh)
 
 	case "thinking":
 		m.thinking += event.Thinking
-		m.status = "Thinking"
+		m.setStatus("Thinking")
 		return m, waitForStreamEvent(m.streamCh)
 
 	case "tool_call_writing":
 		if event.ToolCallName != "" && event.ToolCallArgsLen > 0 {
-			m.status = fmt.Sprintf("Writing tool call [%s] (%d characters)", event.ToolCallName, event.ToolCallArgsLen)
+			m.setStatus(fmt.Sprintf("Writing tool call [%s] (%d characters)", event.ToolCallName, event.ToolCallArgsLen))
 		} else if event.ToolCallName != "" {
-			m.status = fmt.Sprintf("Writing tool call [%s]", event.ToolCallName)
+			m.setStatus(fmt.Sprintf("Writing tool call [%s]", event.ToolCallName))
 		} else {
-			m.status = "Writing tool call..."
+			m.setStatus("Writing tool call...")
 		}
 		return m, waitForStreamEvent(m.streamCh)
 
 	case "tool_call":
 		if event.Tool != nil {
 			m.pendingToolCalls = append(m.pendingToolCalls, *event.Tool)
-			m.status = "Review tool permissions"
+			m.setStatus("Review tool permissions")
 		}
 		return m, waitForStreamEvent(m.streamCh)
 
@@ -261,7 +269,10 @@ func (m Model) handleStreamEvent(event api.StreamEvent) (tea.Model, tea.Cmd) {
 	case "error":
 		if shouldRetry(event.Error, m.retryCount) {
 			m.retryCount++
-			m.status = fmt.Sprintf("Error: %s (retry %d/%d)", formatError(event.Error), m.retryCount, maxRetries)
+			errorMsg := fmt.Sprintf("Error: %s (retry %d/%d)", formatError(event.Error), m.retryCount, maxRetries)
+			m.status = errorMsg
+			m.errorStatus = errorMsg
+			m.errorStatusTime = time.Now()
 			m.streamCh = nil
 			return m, waitForRetry(m.retryCount)
 		}
@@ -269,7 +280,10 @@ func (m Model) handleStreamEvent(event api.StreamEvent) (tea.Model, tea.Cmd) {
 		m.busy = false
 		m.pendingToolCalls = nil
 		m.err = event.Error
-		m.status = fmt.Sprintf("Error: %s", formatError(event.Error))
+		errorMsg := fmt.Sprintf("Error: %s", formatError(event.Error))
+		m.status = errorMsg
+		m.errorStatus = errorMsg
+		m.errorStatusTime = time.Now()
 		return m, nil
 
 	default:
@@ -287,7 +301,8 @@ func (m Model) handleRetry(msg streamRetryMsg) (tea.Model, tea.Cmd) {
 	m.streaming = ""
 	m.thinking = ""
 	m.pendingToolCalls = nil
-	m.status = fmt.Sprintf("Retrying (attempt %d/%d)...", msg.attempt, maxRetries)
+	m.errorStatus = ""
+	m.setStatus(fmt.Sprintf("Retrying (attempt %d/%d)...", msg.attempt, maxRetries))
 	return m, waitForStreamEvent(m.streamCh)
 }
 
@@ -405,29 +420,48 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 		m.thinking = ""
 		m.pendingToolCalls = nil
 
-		// If auto-approve is enabled, approve all tool calls
-		if m.autoApprove {
+		// Separate tools into auto-approved and needs-approval
+		var autoApproved []api.ToolCall
+		var needsApproval []api.ToolCall
+		var needsApprovalIndices []int
+
+		for i, tc := range toolCalls {
+			if !tools.RequiresApproval(tc.Function.Name) {
+				autoApproved = append(autoApproved, tc)
+			} else {
+				needsApproval = append(needsApproval, tc)
+				needsApprovalIndices = append(needsApprovalIndices, i)
+			}
+		}
+
+		// If all tools are auto-approved, execute them
+		if len(needsApproval) == 0 {
 			approvals := make([]bool, len(toolCalls))
 			for i := range approvals {
 				approvals[i] = true
 			}
 			m.busy = true
-			m.status = "Running tools"
+			m.setStatus("Running tools")
 			return m, m.executeToolPlanCmd(msgContent, toolCalls, approvals)
 		}
 
-		if hasPendingApprovals(toolCalls) {
-			m.mode = "permissions"
-			m.modeData = newPermissionMode(msgContent, toolCalls)
-			m.busy = false
-			m.status = "Tool approval required"
-			return m, nil
+		// If we have auto-approved tools, execute them first
+		if len(autoApproved) > 0 {
+			approvals := make([]bool, len(toolCalls))
+			for i := range toolCalls {
+				approvals[i] = !tools.RequiresApproval(toolCalls[i].Function.Name)
+			}
+			m.busy = true
+			m.setStatus("Running tools")
+			return m, m.executeToolPlanCmd(msgContent, toolCalls, approvals)
 		}
 
-		approvals := defaultToolApprovals(toolCalls)
-		m.busy = true
-		m.status = "Running tools"
-		return m, m.executeToolPlanCmd(msgContent, toolCalls, approvals)
+		// All tools need approval
+		m.mode = "permissions"
+		m.modeData = newPermissionMode(msgContent, toolCalls)
+		m.busy = false
+		m.setStatus("Tool approval required")
+		return m, nil
 	}
 
 	// Only add message if we have content
@@ -443,7 +477,7 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 	}
 
 	m.busy = false
-	m.status = "Ready"
+	m.setStatus("Ready")
 	return m, nil
 }
 
@@ -479,7 +513,7 @@ func (m Model) handleToolExecution(msg toolExecutionMsg) (tea.Model, tea.Cmd) {
 		m.addToolResult(name, tools.FormatToolResult(result))
 	}
 
-	m.status = "Continuing after tool results"
+	m.setStatus("Continuing after tool results")
 	m.finalizeUIMessageHandling()
 	return m.beginStream()
 }

@@ -112,23 +112,6 @@ func (m Model) handleSlashCommand(cmd string) (tea.Model, tea.Cmd) {
 		m.resize(m.width, m.height)
 		return m, nil
 
-	case "/tools":
-		toolsList := `Available tools:
-• bash        - Execute a shell command (requires approval)
-• list_files  - List directory contents
-• read_file   - Read file contents
-• write_file  - Write to a file (requires approval)
-• edit_file   - Find & replace text in a file (requires approval)
-• grep        - Search for a pattern in files
-• glob        - Find files matching a pattern
-• file_info   - Get file/directory information
-• edit_soul   - Edit agent's SOUL.md in config dir
-
-Auto-approve: list_files, read_file, grep, glob, file_info, edit_soul`
-		m.messages = append(m.messages, api.Message{Role: "assistant", Content: toolsList})
-		m.status = "Ready"
-		return m, nil
-
 	case "/autoapprove":
 		m.autoApprove = !m.autoApprove
 		status := "disabled"

@@ -155,64 +155,64 @@ func formatTodoItem(item *storage.TodoItem) string {
 	return sb.String()
 }
 
-func getTodoToolDefinitions() []interface{} {
-	return []interface{}{
-		map[string]interface{}{
+func getTodoToolDefinitions() []any {
+	return []any{
+		map[string]any{
 			"type": "function",
-			"function": map[string]interface{}{
+			"function": map[string]any{
 				"name":        "todo_add",
 				"description": "Add a new todo item to the todo list",
-				"parameters": map[string]interface{}{
+				"parameters": map[string]any{
 					"type": "object",
-					"properties": map[string]interface{}{
-						"title":       map[string]interface{}{"type": "string", "description": "The title of the todo item"},
-						"description": map[string]interface{}{"type": "string", "description": "Optional description of the todo item"},
-						"priority":    map[string]interface{}{"type": "string", "description": "Priority level: low, medium, or high (default: medium)"},
-						"due_date":    map[string]interface{}{"type": "string", "description": "Due date in YYYY-MM-DD format"},
+					"properties": map[string]any{
+						"title":       map[string]any{"type": "string", "description": "The title of the todo item"},
+						"description": map[string]any{"type": "string", "description": "Optional description of the todo item"},
+						"priority":    map[string]any{"type": "string", "description": "Priority level: low, medium, or high (default: medium)"},
+						"due_date":    map[string]any{"type": "string", "description": "Due date in YYYY-MM-DD format"},
 					},
 					"required": []string{"title"},
 				},
 			},
 		},
-		map[string]interface{}{
+		map[string]any{
 			"type": "function",
-			"function": map[string]interface{}{
+			"function": map[string]any{
 				"name":        "todo_list",
 				"description": "List all todo items, optionally filtered by status",
-				"parameters": map[string]interface{}{
+				"parameters": map[string]any{
 					"type": "object",
-					"properties": map[string]interface{}{
-						"status": map[string]interface{}{"type": "string", "description": "Filter by status: pending, in_progress, or completed"},
+					"properties": map[string]any{
+						"status": map[string]any{"type": "string", "description": "Filter by status: pending, in_progress, or completed"},
 					},
 				},
 			},
 		},
-		map[string]interface{}{
+		map[string]any{
 			"type": "function",
-			"function": map[string]interface{}{
+			"function": map[string]any{
 				"name":        "todo_update",
 				"description": "Update a todo item's status, priority, or due date",
-				"parameters": map[string]interface{}{
+				"parameters": map[string]any{
 					"type": "object",
-					"properties": map[string]interface{}{
-						"id":        map[string]interface{}{"type": "string", "description": "The ID of the todo item"},
-						"status":    map[string]interface{}{"type": "string", "description": "New status: pending, in_progress, or completed"},
-						"priority":  map[string]interface{}{"type": "string", "description": "New priority: low, medium, or high"},
-						"due_date":  map[string]interface{}{"type": "string", "description": "New due date in YYYY-MM-DD format"},
+					"properties": map[string]any{
+						"id":       map[string]any{"type": "string", "description": "The ID of the todo item"},
+						"status":   map[string]any{"type": "string", "description": "New status: pending, in_progress, or completed"},
+						"priority": map[string]any{"type": "string", "description": "New priority: low, medium, or high"},
+						"due_date": map[string]any{"type": "string", "description": "New due date in YYYY-MM-DD format"},
 					},
 					"required": []string{"id"},
 				},
 			},
 		},
-		map[string]interface{}{
+		map[string]any{
 			"type": "function",
-			"function": map[string]interface{}{
+			"function": map[string]any{
 				"name":        "todo_remove",
 				"description": "Remove a todo item from the list",
-				"parameters": map[string]interface{}{
+				"parameters": map[string]any{
 					"type": "object",
-					"properties": map[string]interface{}{
-						"id": map[string]interface{}{"type": "string", "description": "The ID of the todo item to remove"},
+					"properties": map[string]any{
+						"id": map[string]any{"type": "string", "description": "The ID of the todo item to remove"},
 					},
 					"required": []string{"id"},
 				},

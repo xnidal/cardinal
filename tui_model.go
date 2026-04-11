@@ -40,7 +40,7 @@ type Model struct {
 	viewport         viewport.Model
 	useViewport      bool
 	mode             string
-	modeData         interface{}
+	modeData         any
 	busy             bool
 	status           string
 	soul             string
@@ -53,6 +53,8 @@ type Model struct {
 	lastStatus       string
 	contextUsed      int
 	contextLimit     int
+	errorStatus      string
+	errorStatusTime  time.Time
 }
 
 var slashCommands = []string{
@@ -66,7 +68,6 @@ var slashCommands = []string{
 	"/profile edit",
 	"/endpoint",
 	"/apikey",
-	"/tools",
 	"/autoapprove",
 }
 
@@ -416,36 +417,5 @@ func (m *Model) updateViewportContent() {
 }
 
 func (m *Model) renderConversationContent() string {
-	hasStreaming := strings.TrimSpace(m.streaming) != ""
-	hasThinking := strings.TrimSpace(m.thinking) != ""
-
-	if len(m.messages) == 0 && !hasStreaming && !hasThinking && m.err == nil {
-		return m.renderWelcome()
-	}
-
-	var blocks []string
-
-	if m.viewport.YOffset > 0 {
-		blocks = append(blocks, dimStyle.Render(fmt.Sprintf(" ↑ %d lines scrolled", m.viewport.YOffset)))
-	}
-
-	visible := m.messages
-	for i, message := range visible {
-		if rendered := m.renderMessage(message); rendered != "" {
-			blocks = append(blocks, rendered)
-		}
-		if i < len(visible)-1 {
-			blocks = append(blocks, "")
-		}
-	}
-
-	if hasThinking || hasStreaming {
-		blocks = append(blocks, m.renderStreamingMessage())
-	}
-
-	if m.err != nil {
-		blocks = append(blocks, errorStyle.Render(" Error: "+m.err.Error()))
-	}
-
-	return lipgloss.JoinVertical(lipgloss.Left, blocks...)
+	return m.renderChatHistory(m.messages, m.viewport.YOffset, strings.TrimSpace(m.streaming) != "", strings.TrimSpace(m.thinking) != "", m.err)
 }

@@ -57,6 +57,10 @@ func NewToolHandler(workingDir string, onEditSoul func()) *ToolHandler {
 	th.tools["todo_list"] = th.executeTodoList
 	th.tools["todo_update"] = th.executeTodoUpdate
 	th.tools["todo_remove"] = th.executeTodoRemove
+	th.tools["subagent"] = th.executeSubAgent
+	th.tools["subagent_status"] = th.executeSubAgentStatus
+	th.tools["subagent_list"] = th.executeSubAgentList
+	th.tools["subagent_clear"] = th.executeSubAgentClear
 
 	return th
 }
@@ -71,7 +75,7 @@ func (th *ToolHandler) Execute(call ToolCall) ToolResult {
 
 func RequiresApproval(name string) bool {
 	switch name {
-	case "list_files", "read_file", "grep", "glob", "file_info", "edit_soul", "calculate", "todo_list", "subagent_status", "subagent_list", "subagent_clear":
+	case "list_files", "read_file", "grep", "glob", "file_info", "edit_soul", "calculate", "todo_list", "subagent", "subagent_status", "subagent_list", "subagent_clear":
 		return false
 	default:
 		return true
@@ -252,7 +256,12 @@ func (th *ToolHandler) executeListFiles(args string) ToolResult {
 		files = append(files, prefix+entry.Name())
 	}
 
-	return ToolResult{Name: "list_files", Success: true, Output: strings.Join(files, "\n")}
+	displayPath := params.Path
+	if displayPath == "" {
+		displayPath = "."
+	}
+
+	return ToolResult{Name: "list_files", Success: true, Output: strings.Join(files, "\n"), Path: displayPath}
 }
 
 func (th *ToolHandler) executeReadFile(args string) ToolResult {
@@ -558,7 +567,7 @@ func (th *ToolHandler) executeGlob(args string) ToolResult {
 	}
 
 	if len(matches) == 0 {
-		return ToolResult{Name: "glob", Success: true, Output: "No matches found"}
+		return ToolResult{Name: "glob", Success: true, Output: "No matches found", Path: searchPath}
 	}
 
 	var results []string
@@ -572,7 +581,7 @@ func (th *ToolHandler) executeGlob(args string) ToolResult {
 		results = append(results, prefix+relPath)
 	}
 
-	return ToolResult{Name: "glob", Success: true, Output: strings.Join(results, "\n")}
+	return ToolResult{Name: "glob", Success: true, Output: strings.Join(results, "\n"), Path: searchPath}
 }
 
 func (th *ToolHandler) executeFileInfo(args string) ToolResult {
@@ -1015,153 +1024,336 @@ func FormatToolResult(result ToolResult) string {
 	return output.String()
 }
 
-func GetToolDefinitions() []interface{} {
-	return []interface{}{
-		map[string]interface{}{
+func FormatToolResultCLI(result ToolResult, toolName, args string) string {
+	var output strings.Builder
+
+	var toolLabel string
+	switch toolName {
+	case "list_files":
+		var params struct {
+			Path string `json:"path"`
+		}
+		if json.Unmarshal([]byte(args), &params) == nil {
+			path := params.Path
+			if path == "" {
+				path = "."
+			}
+			toolLabel = "list " + path
+		} else {
+			toolLabel = "list_files"
+		}
+	case "glob":
+		var params struct {
+			Path    string `json:"path"`
+			Pattern string `json:"pattern"`
+		}
+		if json.Unmarshal([]byte(args), &params) == nil {
+			toolLabel = "glob " + params.Pattern
+			if params.Path != "" {
+				toolLabel += " (" + params.Path + ")"
+			}
+		} else {
+			toolLabel = "glob"
+		}
+	case "bash":
+		var params struct {
+			Command string `json:"command"`
+		}
+		if json.Unmarshal([]byte(args), &params) == nil {
+			cmd := params.Command
+			if len(cmd) > 40 {
+				cmd = cmd[:37] + "..."
+			}
+			toolLabel = "bash: " + cmd
+		} else {
+			toolLabel = "bash"
+		}
+	case "read_file":
+		var params struct {
+			Path   string `json:"path"`
+			Offset int    `json:"offset,omitempty"`
+			Limit  int    `json:"limit,omitempty"`
+		}
+		if json.Unmarshal([]byte(args), &params) == nil {
+			toolLabel = "read " + params.Path
+			if params.Offset > 0 || params.Limit > 0 {
+				toolLabel += fmt.Sprintf(" (line %d", params.Offset+1)
+				if params.Limit > 0 {
+					toolLabel += fmt.Sprintf(", %d lines", params.Limit)
+				}
+				toolLabel += ")"
+			}
+		} else {
+			toolLabel = "read_file"
+		}
+	case "grep":
+		var params struct {
+			Pattern string `json:"pattern"`
+			Include string `json:"include,omitempty"`
+			Path    string `json:"path,omitempty"`
+		}
+		if json.Unmarshal([]byte(args), &params) == nil {
+			toolLabel = "grep " + params.Pattern
+			if params.Include != "" {
+				toolLabel += " in " + params.Include
+			}
+		} else {
+			toolLabel = "grep"
+		}
+	case "write_file":
+		var params struct {
+			Path string `json:"path"`
+		}
+		if json.Unmarshal([]byte(args), &params) == nil {
+			toolLabel = "write " + params.Path
+		} else {
+			toolLabel = "write_file"
+		}
+	case "edit_file":
+		var params struct {
+			Path string `json:"path"`
+		}
+		if json.Unmarshal([]byte(args), &params) == nil {
+			toolLabel = "edit " + params.Path
+		} else {
+			toolLabel = "edit_file"
+		}
+	case "calculate":
+		var params struct {
+			Expression string `json:"expression"`
+		}
+		if json.Unmarshal([]byte(args), &params) == nil {
+			toolLabel = "calculate: " + params.Expression
+		} else {
+			toolLabel = "calculate"
+		}
+	default:
+		toolLabel = toolName
+	}
+
+	output.WriteString(fmt.Sprintf("> %s\n", toolLabel))
+
+	if !result.Success && result.Error != "" {
+		output.WriteString(fmt.Sprintf("Error: %s\n", result.Error))
+		return output.String()
+	}
+
+	if result.Output != "" {
+		lines := strings.Split(result.Output, "\n")
+		maxWidth := 80
+		if len(lines) > 10 {
+			lines = append(lines[:10], fmt.Sprintf("... %d more lines", len(lines)-10))
+		}
+		for _, line := range lines {
+			if len(line) > maxWidth {
+				line = line[:maxWidth-3] + "..."
+			}
+			output.WriteString(line + "\n")
+		}
+	}
+
+	return output.String()
+}
+
+func GetToolDefinitions() []any {
+	return []any{
+		map[string]any{
 			"type": "function",
-			"function": map[string]interface{}{
+			"function": map[string]any{
 				"name":        "bash",
 				"description": "Execute a bash command in the working directory",
-				"parameters": map[string]interface{}{
+				"parameters": map[string]any{
 					"type": "object",
-					"properties": map[string]interface{}{
-						"command": map[string]interface{}{"type": "string", "description": "The bash command to execute"},
+					"properties": map[string]any{
+						"command": map[string]any{"type": "string", "description": "The bash command to execute"},
 					},
 					"required": []string{"command"},
 				},
 			},
 		},
-		map[string]interface{}{
+		map[string]any{
 			"type": "function",
-			"function": map[string]interface{}{
+			"function": map[string]any{
 				"name":        "list_files",
 				"description": "List files in a directory under the working directory",
-				"parameters": map[string]interface{}{
+				"parameters": map[string]any{
 					"type": "object",
-					"properties": map[string]interface{}{
-						"path": map[string]interface{}{"type": "string", "description": "The directory path"},
+					"properties": map[string]any{
+						"path": map[string]any{"type": "string", "description": "The directory path"},
 					},
 				},
 			},
 		},
-		map[string]interface{}{
+		map[string]any{
 			"type": "function",
-			"function": map[string]interface{}{
+			"function": map[string]any{
 				"name":        "read_file",
 				"description": "Read the contents of a file under the working directory",
-				"parameters": map[string]interface{}{
+				"parameters": map[string]any{
 					"type": "object",
-					"properties": map[string]interface{}{
-						"path":   map[string]interface{}{"type": "string", "description": "The file path"},
-						"offset": map[string]interface{}{"type": "integer", "description": "Line number to start reading from (0-based)"},
-						"limit":  map[string]interface{}{"type": "integer", "description": "Maximum number of lines to read (default: all or 6000 chars)"},
+					"properties": map[string]any{
+						"path":   map[string]any{"type": "string", "description": "The file path"},
+						"offset": map[string]any{"type": "integer", "description": "Line number to start reading from (0-based)"},
+						"limit":  map[string]any{"type": "integer", "description": "Maximum number of lines to read (default: all or 6000 chars)"},
 					},
 					"required": []string{"path"},
 				},
 			},
 		},
-		map[string]interface{}{
+		map[string]any{
 			"type": "function",
-			"function": map[string]interface{}{
+			"function": map[string]any{
 				"name":        "write_file",
 				"description": "Write content to a file under the working directory",
-				"parameters": map[string]interface{}{
+				"parameters": map[string]any{
 					"type": "object",
-					"properties": map[string]interface{}{
-						"path":    map[string]interface{}{"type": "string", "description": "The file path"},
-						"content": map[string]interface{}{"type": "string", "description": "The content to write"},
+					"properties": map[string]any{
+						"path":    map[string]any{"type": "string", "description": "The file path"},
+						"content": map[string]any{"type": "string", "description": "The content to write"},
 					},
 					"required": []string{"path", "content"},
 				},
 			},
 		},
-		map[string]interface{}{
+		map[string]any{
 			"type": "function",
-			"function": map[string]interface{}{
+			"function": map[string]any{
 				"name":        "edit_file",
 				"description": "Find and replace text in a file (replaces only the first occurrence)",
-				"parameters": map[string]interface{}{
+				"parameters": map[string]any{
 					"type": "object",
-					"properties": map[string]interface{}{
-						"path":    map[string]interface{}{"type": "string", "description": "The file path"},
-						"find":    map[string]interface{}{"type": "string", "description": "Text to find"},
-						"replace": map[string]interface{}{"type": "string", "description": "Text to replace it with"},
+					"properties": map[string]any{
+						"path":    map[string]any{"type": "string", "description": "The file path"},
+						"find":    map[string]any{"type": "string", "description": "Text to find"},
+						"replace": map[string]any{"type": "string", "description": "Text to replace it with"},
 					},
 					"required": []string{"path", "find", "replace"},
 				},
 			},
 		},
-		map[string]interface{}{
+		map[string]any{
 			"type": "function",
-			"function": map[string]interface{}{
+			"function": map[string]any{
 				"name":        "grep",
 				"description": "Search for a pattern in files",
-				"parameters": map[string]interface{}{
+				"parameters": map[string]any{
 					"type": "object",
-					"properties": map[string]interface{}{
-						"pattern": map[string]interface{}{"type": "string", "description": "The regex pattern to search for"},
-						"path":    map[string]interface{}{"type": "string", "description": "Directory to search in (default: current directory)"},
-						"include": map[string]interface{}{"type": "string", "description": "File pattern to include (e.g., *.go, *.js)"},
-						"context": map[string]interface{}{"type": "integer", "description": "Lines of context around matches (default: 2)"},
+					"properties": map[string]any{
+						"pattern": map[string]any{"type": "string", "description": "The regex pattern to search for"},
+						"path":    map[string]any{"type": "string", "description": "Directory to search in (default: current directory)"},
+						"include": map[string]any{"type": "string", "description": "File pattern to include (e.g., *.go, *.js)"},
+						"context": map[string]any{"type": "integer", "description": "Lines of context around matches (default: 2)"},
 					},
 					"required": []string{"pattern"},
 				},
 			},
 		},
-		map[string]interface{}{
+		map[string]any{
 			"type": "function",
-			"function": map[string]interface{}{
+			"function": map[string]any{
 				"name":        "glob",
 				"description": "Find files matching a pattern",
-				"parameters": map[string]interface{}{
+				"parameters": map[string]any{
 					"type": "object",
-					"properties": map[string]interface{}{
-						"path":    map[string]interface{}{"type": "string", "description": "Directory to search in (default: current directory)"},
-						"pattern": map[string]interface{}{"type": "string", "description": "Glob pattern (e.g., *.go, **/*.txt)"},
+					"properties": map[string]any{
+						"path":    map[string]any{"type": "string", "description": "Directory to search in (default: current directory)"},
+						"pattern": map[string]any{"type": "string", "description": "Glob pattern (e.g., *.go, **/*.txt)"},
 					},
 				},
 			},
 		},
-		map[string]interface{}{
+		map[string]any{
 			"type": "function",
-			"function": map[string]interface{}{
+			"function": map[string]any{
 				"name":        "file_info",
 				"description": "Get information about a file or directory",
-				"parameters": map[string]interface{}{
+				"parameters": map[string]any{
 					"type": "object",
-					"properties": map[string]interface{}{
-						"path": map[string]interface{}{"type": "string", "description": "The file or directory path"},
+					"properties": map[string]any{
+						"path": map[string]any{"type": "string", "description": "The file or directory path"},
 					},
 					"required": []string{"path"},
 				},
 			},
 		},
-		map[string]interface{}{
+		map[string]any{
 			"type": "function",
-			"function": map[string]interface{}{
+			"function": map[string]any{
 				"name":        "calculate",
 				"description": "Evaluate a mathematical expression with 100% certainty. Supports +, -, *, /, ^ (power), ! (factorial), and parentheses.",
-				"parameters": map[string]interface{}{
+				"parameters": map[string]any{
 					"type": "object",
-					"properties": map[string]interface{}{
-						"expression": map[string]interface{}{"type": "string", "description": "Mathematical expression to evaluate (e.g., '2 + 2', '(5 * 3) / 2', '2^10', '5!')"},
+					"properties": map[string]any{
+						"expression": map[string]any{"type": "string", "description": "Mathematical expression to evaluate (e.g., '2 + 2', '(5 * 3) / 2', '2^10', '5!')"},
 					},
 					"required": []string{"expression"},
 				},
 			},
 		},
-		map[string]interface{}{
+		map[string]any{
 			"type": "function",
-			"function": map[string]interface{}{
+			"function": map[string]any{
 				"name":        "edit_soul",
 				"description": "Edit the agent's SOUL.md file in the cardinal config directory",
-				"parameters": map[string]interface{}{
+				"parameters": map[string]any{
 					"type": "object",
-					"properties": map[string]interface{}{
-						"find":    map[string]interface{}{"type": "string", "description": "Text to find in SOUL.md"},
-						"replace": map[string]interface{}{"type": "string", "description": "Text to replace it with"},
+					"properties": map[string]any{
+						"find":    map[string]any{"type": "string", "description": "Text to find in SOUL.md"},
+						"replace": map[string]any{"type": "string", "description": "Text to replace it with"},
 					},
 					"required": []string{"find", "replace"},
+				},
+			},
+		},
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "subagent",
+				"description": "Launch a sub-agent to perform a task. The sub-agent uses the same tools as the main agent but runs in a separate context.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"profile":       map[string]any{"type": "string", "description": "Model profile to use: fast, smart, or tiny (default: fast)"},
+						"prompt":        map[string]any{"type": "string", "description": "Task description for the sub-agent"},
+						"system_add_on": map[string]any{"type": "string", "description": "Additional system instructions for the sub-agent"},
+					},
+					"required": []string{"prompt"},
+				},
+			},
+		},
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "subagent_status",
+				"description": "Get the status and result of a sub-agent task",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"task_id": map[string]any{"type": "string", "description": "The task ID returned from subagent"},
+					},
+					"required": []string{"task_id"},
+				},
+			},
+		},
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "subagent_list",
+				"description": "List all active sub-agent tasks",
+				"parameters": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{},
+				},
+			},
+		},
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "subagent_clear",
+				"description": "Clear completed sub-agent tasks",
+				"parameters": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{},
 				},
 			},
 		},
