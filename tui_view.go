@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"path/filepath"
@@ -154,21 +155,11 @@ func (m Model) renderMode() string {
 }
 
 func (m Model) renderHeader() string {
-	info := subtitleStyle.Render(
-		" " + m.cfg.ActiveProfileName() + " > " + m.cfg.Model + " @ " + compactEndpoint(m.cfg.APIURL),
-	)
-
-	title := lipgloss.NewStyle().
+	return lipgloss.NewStyle().
 		Foreground(accentColor).
 		Bold(true).
+		MarginBottom(1).
 		Render("Cardinal")
-
-	return lipgloss.JoinVertical(
-		lipgloss.Left,
-		lipgloss.NewStyle().MarginBottom(1).Render(title),
-		info,
-		"",
-	)
 }
 
 func (m Model) renderConversation() string {
@@ -188,6 +179,12 @@ func (m Model) renderChatHistory(messages []api.Message, scrollOffset int, hasSt
 	}
 
 	var blocks []string
+
+	// Always show model info at the top
+	modelInfo := lipgloss.NewStyle().
+		Foreground(dimColor).
+		Render(m.cfg.ActiveProfileName() + " > " + m.cfg.Model + " @ " + compactEndpoint(m.cfg.APIURL))
+	blocks = append(blocks, modelInfo, "")
 
 	if scrollOffset > 0 {
 		blocks = append(blocks,
@@ -239,28 +236,35 @@ func (m Model) renderWelcome() string {
 	}
 
 	var lines []string
+
+	// Show model info at top
+	lines = append(lines,
+		lipgloss.NewStyle().
+			Foreground(dimColor).
+			Render(m.cfg.ActiveProfileName()+" > "+m.cfg.Model+" @ "+compactEndpoint(m.cfg.APIURL)),
+	)
+
+	lines = append(lines, "")
+
 	lines = append(lines,
 		lipgloss.NewStyle().
 			Foreground(accentColor).
 			Bold(true).
 			Render("Start a conversation"),
-		"",
 	)
 
 	for _, c := range commands {
 		lines = append(lines,
 			lipgloss.NewStyle().
 				Foreground(primaryColor).
-				Render("  "+c.cmd)+
+				Render(c.cmd)+
 				lipgloss.NewStyle().
 					Foreground(dimColor).
-					Render(" -> "+c.desc),
+					Render("  "+c.desc),
 		)
 	}
 
-	return lipgloss.NewStyle().
-		Padding(1, 0).
-		Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 
 func (m Model) renderMessage(msg api.Message) string {
@@ -274,27 +278,47 @@ func (m Model) renderMessage(msg api.Message) string {
 
 	label, color := roleMeta(msg)
 	content := strings.TrimSpace(msg.Content)
+	thinking := strings.TrimSpace(msg.Thinking)
 
-	if content == "" && len(msg.ToolCalls) == 0 {
+	if content == "" && thinking == "" && len(msg.ToolCalls) == 0 {
 		return ""
 	}
 
 	var icon string = ">"
 
-	labelLine := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(color).
-		Render(icon + " " + label)
-
-	contentBox := lipgloss.NewStyle().
-		PaddingLeft(3).
-		Width(max(m.width-4, 20)).
-		Render(content)
-
 	var blocks []string
-	blocks = append(blocks, labelLine)
 
+	// Render thinking section if present
+	if thinking != "" {
+		thinkingLabel := lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("8")).
+			Render(icon + " " + label + " [thinking]")
+
+		thinkingBox := lipgloss.NewStyle().
+			PaddingLeft(3).
+			Width(max(m.width-4, 20)).
+			Italic(true).
+			Foreground(lipgloss.Color("8")).
+			Render(thinking)
+
+		blocks = append(blocks, thinkingLabel)
+		blocks = append(blocks, thinkingBox)
+	}
+
+	// Render content section if present
 	if content != "" {
+		contentLabel := lipgloss.NewStyle().
+			Bold(true).
+			Foreground(color).
+			Render(icon + " " + label)
+
+		contentBox := lipgloss.NewStyle().
+			PaddingLeft(3).
+			Width(max(m.width-4, 20)).
+			Render(content)
+
+		blocks = append(blocks, contentLabel)
 		blocks = append(blocks, contentBox)
 	}
 
@@ -316,7 +340,15 @@ func (m Model) renderToolResult(msg api.Message) string {
 
 	switch toolName {
 	case "read_file":
-		path := extractPathFromToolResult(msg.Content)
+		var path string
+		if msg.ToolArgs != "" {
+			var params struct {
+				Path string `json:"path"`
+			}
+			if err := json.Unmarshal([]byte(msg.ToolArgs), &params); err == nil {
+				path = params.Path
+			}
+		}
 		displayPath := m.formatPath(path)
 		linesInfo := extractLinesFromToolResult(msg.Content)
 		if linesInfo != "" {
@@ -330,19 +362,31 @@ func (m Model) renderToolResult(msg api.Message) string {
 		}
 
 	case "list_files":
-		path := extractPathFromToolResult(msg.Content)
+		var path string
+		if msg.ToolArgs != "" {
+			var params struct {
+				Path string `json:"path"`
+			}
+			if err := json.Unmarshal([]byte(msg.ToolArgs), &params); err == nil {
+				path = params.Path
+			}
+		}
 		displayPath := m.formatPath(path)
 		if displayPath == "" {
 			displayPath = "."
 		}
 
 		lines := strings.Split(msg.Content, "\n")
+		// Skip the [list_files] header if present
+		if len(lines) > 0 && strings.TrimSpace(lines[0]) == "[list_files]" {
+			lines = lines[1:]
+		}
 		if len(lines) > maxHeight {
 			lines = append(lines[:maxHeight],
 				lipgloss.NewStyle().
 					Foreground(warningColor).
 					Italic(true).
-					Render(fmt.Sprintf("  ... %d more results", len(lines)-maxHeight)),
+					Render(fmt.Sprintf(" ... %d more results", len(lines)-maxHeight)),
 			)
 		}
 
@@ -358,19 +402,17 @@ func (m Model) renderToolResult(msg api.Message) string {
 
 		header := lipgloss.NewStyle().
 			Foreground(accentColor).
-			Render("> list_files " + displayPath)
+			Render("> list " + displayPath)
 
-		outputBox := lipgloss.NewStyle().
+		content = header + "\n" + lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(dimColor).
 			Padding(0, 1).
 			Width(maxWidth).
 			Render(strings.Join(formattedLines, "\n"))
 
-		content = header + "\n" + outputBox
-
 	case "bash":
-		content = m.formatBashOutput(msg.Content, maxHeight, maxWidth)
+		content = m.formatBashOutput(msg.Content, msg.ToolArgs, maxHeight, maxWidth)
 
 	case "write_file":
 		content = m.formatWriteFileOutput(msg.Content, maxHeight, maxWidth)
@@ -379,13 +421,13 @@ func (m Model) renderToolResult(msg api.Message) string {
 		content = m.formatEditFileOutput(msg.Content, maxHeight, maxWidth)
 
 	case "grep":
-		content = m.formatGrepOutput(msg.Content, maxHeight, maxWidth)
+		content = m.formatGrepOutput(msg.Content, msg.ToolArgs, maxHeight, maxWidth)
 
 	case "glob":
-		content = m.formatGlobOutput(msg.Content, maxHeight, maxWidth)
+		content = m.formatGlobOutput(msg.Content, msg.ToolArgs, maxHeight, maxWidth)
 
 	case "file_info":
-		content = m.formatFileInfoOutput(msg.Content, maxHeight, maxWidth)
+		content = m.formatFileInfoOutput(msg.Content, msg.ToolArgs, maxHeight, maxWidth)
 
 	case "edit_soul":
 		content = lipgloss.NewStyle().
@@ -393,7 +435,7 @@ func (m Model) renderToolResult(msg api.Message) string {
 			Render("> edit_soul")
 
 	case "calculate":
-		content = m.formatCalculateOutput(msg.Content, maxHeight, maxWidth)
+		content = m.formatCalculateOutput(msg.Content, msg.ToolArgs, maxHeight, maxWidth)
 
 	case "subagent", "subagent_status", "subagent_list", "subagent_clear":
 		content = m.formatSubagentOutput(msg.Content, maxHeight, maxWidth)
@@ -407,14 +449,37 @@ func (m Model) renderToolResult(msg api.Message) string {
 		Render(content)
 }
 
-func (m Model) formatBashOutput(content string, maxHeight, maxWidth int) string {
+func (m Model) formatBashOutput(content, toolArgs string, maxHeight, maxWidth int) string {
+	var command string
+	if toolArgs != "" {
+		var params struct {
+			Command string `json:"command"`
+		}
+		if err := json.Unmarshal([]byte(toolArgs), &params); err == nil {
+			command = params.Command
+		}
+	}
+
+	// If no output, just show the header
+	if strings.TrimSpace(content) == "" {
+		header := "> bash"
+		if command != "" {
+			displayCmd := command
+			if len(displayCmd) > maxWidth-10 {
+				displayCmd = displayCmd[:maxWidth-13] + "..."
+			}
+			header = "> bash: " + displayCmd
+		}
+		return lipgloss.NewStyle().Foreground(accentColor).Render(header + " (no output)")
+	}
+
 	lines := strings.Split(content, "\n")
 	if len(lines) > maxHeight {
 		lines = append(lines[:maxHeight],
 			lipgloss.NewStyle().
 				Foreground(warningColor).
 				Italic(true).
-				Render(fmt.Sprintf("  ... %d more lines", len(lines)-maxHeight)),
+				Render(fmt.Sprintf(" ... %d more lines", len(lines)-maxHeight)),
 		)
 	}
 
@@ -428,18 +493,25 @@ func (m Model) formatBashOutput(content string, maxHeight, maxWidth int) string 
 		}
 	}
 
-	header := lipgloss.NewStyle().
+	header := "> bash"
+	if command != "" {
+		// Truncate long commands
+		displayCmd := command
+		if len(displayCmd) > maxWidth-10 {
+			displayCmd = displayCmd[:maxWidth-13] + "..."
+		}
+		header = "> bash: " + displayCmd
+	}
+
+	return lipgloss.NewStyle().
 		Foreground(accentColor).
-		Render("> bash")
-
-	outputBox := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(dimColor).
-		Padding(0, 1).
-		Width(maxWidth).
-		Render(strings.Join(formattedLines, "\n"))
-
-	return header + "\n" + outputBox
+		Render(header) + "\n" +
+		lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(dimColor).
+			Padding(0, 1).
+			Width(maxWidth).
+			Render(strings.Join(formattedLines, "\n"))
 }
 
 func (m Model) formatWriteFileOutput(content string, maxHeight, maxWidth int) string {
@@ -451,7 +523,17 @@ func (m Model) formatWriteFileOutput(content string, maxHeight, maxWidth int) st
 		Render("> write " + displayPath)
 }
 
-func (m Model) formatCalculateOutput(content string, maxHeight, maxWidth int) string {
+func (m Model) formatCalculateOutput(content, toolArgs string, maxHeight, maxWidth int) string {
+	var expression string
+	if toolArgs != "" {
+		var params struct {
+			Expression string `json:"expression"`
+		}
+		if err := json.Unmarshal([]byte(toolArgs), &params); err == nil {
+			expression = params.Expression
+		}
+	}
+
 	lines := strings.Split(content, "\n")
 	var outputLines []string
 	for _, line := range lines {
@@ -463,10 +545,21 @@ func (m Model) formatCalculateOutput(content string, maxHeight, maxWidth int) st
 	if len(outputLines) > maxHeight {
 		outputLines = append(outputLines[:maxHeight], fmt.Sprintf("... %d more", len(outputLines)-maxHeight))
 	}
-	if len(outputLines) > 0 {
+
+	result := strings.Join(outputLines, " ")
+
+	if expression != "" && result != "" {
 		return lipgloss.NewStyle().
 			Foreground(accentColor).
-			Render("> calculate: " + strings.Join(outputLines, " "))
+			Render("> calculate " + expression + " = " + result)
+	} else if expression != "" {
+		return lipgloss.NewStyle().
+			Foreground(accentColor).
+			Render("> calculate " + expression)
+	} else if result != "" {
+		return lipgloss.NewStyle().
+			Foreground(accentColor).
+			Render("> calculate: " + result)
 	}
 	return lipgloss.NewStyle().Foreground(accentColor).Render("> calculate")
 }
@@ -510,15 +603,19 @@ func (m Model) formatEditFileOutput(content string, maxHeight, maxWidth int) str
 		Render("> edit " + displayPath)
 }
 
-func (m Model) formatGrepOutput(content string, maxHeight, maxWidth int) string {
-	lines := strings.Split(content, "\n")
-
-	// Extract pattern from first line if it's a summary
+func (m Model) formatGrepOutput(content, toolArgs string, maxHeight, maxWidth int) string {
+	// Parse pattern from tool arguments
 	var pattern string
-	if len(lines) > 0 && !strings.HasPrefix(lines[0], "===") && !strings.HasPrefix(lines[0], "---") {
-		pattern = strings.TrimSpace(lines[0])
-		lines = lines[1:]
+	if toolArgs != "" {
+		var params struct {
+			Pattern string `json:"pattern"`
+		}
+		if err := json.Unmarshal([]byte(toolArgs), &params); err == nil {
+			pattern = params.Pattern
+		}
 	}
+
+	lines := strings.Split(content, "\n")
 
 	// Count actual matches
 	matchCount := 0
@@ -542,8 +639,20 @@ func (m Model) formatGrepOutput(content string, maxHeight, maxWidth int) string 
 		Render(headerText)
 }
 
-func (m Model) formatGlobOutput(content string, maxHeight, maxWidth int) string {
-	path := extractPathFromToolResult(content)
+func (m Model) formatGlobOutput(content, toolArgs string, maxHeight, maxWidth int) string {
+	var pattern string
+	var path string
+	if toolArgs != "" {
+		var params struct {
+			Pattern string `json:"pattern"`
+			Path    string `json:"path"`
+		}
+		if err := json.Unmarshal([]byte(toolArgs), &params); err == nil {
+			pattern = params.Pattern
+			path = params.Path
+		}
+	}
+
 	displayPath := m.formatPath(path)
 	if displayPath == "" {
 		displayPath = "."
@@ -574,13 +683,24 @@ func (m Model) formatGlobOutput(content string, maxHeight, maxWidth int) string 
 		formattedLines = append(formattedLines,
 			lipgloss.NewStyle().
 				Foreground(dimColor).
-				Render("  "+line),
+				Render(" "+line),
 		)
 	}
 
+	headerText := "* Glob"
+	if pattern != "" {
+		headerText = "* Glob \"" + pattern + "\""
+		if displayPath != "." {
+			headerText += " in " + displayPath
+		}
+	} else if displayPath != "." {
+		headerText = "* Glob in " + displayPath
+	}
+	headerText += fmt.Sprintf(" (%d result%s)", len(files), pluralize(len(files)))
+
 	header := lipgloss.NewStyle().
 		Foreground(accentColor).
-		Render(fmt.Sprintf("* Glob \"%s\" (%d result%s)", displayPath, len(files), pluralize(len(files))))
+		Render(headerText)
 
 	if len(formattedLines) == 0 {
 		return header
@@ -596,8 +716,23 @@ func (m Model) formatGlobOutput(content string, maxHeight, maxWidth int) string 
 	return header + "\n" + outputBox
 }
 
-func (m Model) formatFileInfoOutput(content string, maxHeight, maxWidth int) string {
-	return lipgloss.NewStyle().Foreground(accentColor).Render("> file_info")
+func (m Model) formatFileInfoOutput(content, toolArgs string, maxHeight, maxWidth int) string {
+	var path string
+	if toolArgs != "" {
+		var params struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal([]byte(toolArgs), &params); err == nil {
+			path = params.Path
+		}
+	}
+
+	displayPath := m.formatPath(path)
+	if displayPath == "" {
+		displayPath = "file"
+	}
+
+	return lipgloss.NewStyle().Foreground(accentColor).Render("> file_info " + displayPath)
 }
 
 func (m Model) formatDefaultToolOutput(content string, maxHeight, maxWidth int) string {
@@ -787,8 +922,8 @@ func extractPathFromToolResult(content string) string {
 			}
 		}
 		if strings.Contains(line, "path=") {
-			idx := strings.Index(line, "path=")
-			rest := line[idx+5:]
+			_, after, _ := strings.Cut(line, "path=")
+			rest := after
 			if idx := strings.Index(rest, "\""); idx > 0 {
 				rest = rest[:idx]
 			}
@@ -799,8 +934,8 @@ func extractPathFromToolResult(content string) string {
 }
 
 func extractLinesFromToolResult(content string) string {
-	lines := strings.Split(content, "\n")
-	for _, line := range lines {
+	lines := strings.SplitSeq(content, "\n")
+	for line := range lines {
 		if strings.Contains(line, "(") && strings.Contains(line, ")") {
 			start := strings.Index(line, "(")
 			end := strings.Index(line, ")")
@@ -809,8 +944,8 @@ func extractLinesFromToolResult(content string) string {
 			}
 		}
 		if strings.Contains(line, "lines=") {
-			idx := strings.Index(line, "lines=")
-			rest := line[idx+6:]
+			_, after, _ := strings.Cut(line, "lines=")
+			rest := after
 			if idx := strings.Index(rest, "\""); idx > 0 {
 				rest = rest[:idx]
 			}
@@ -835,20 +970,25 @@ func (m Model) renderStreamingMessage() string {
 	thinking := strings.TrimSpace(m.thinking)
 	streaming := strings.TrimSpace(m.streaming)
 
-	// If we have thinking content, show it
+	var blocks []string
+
+	// Render thinking section if present
 	if thinking != "" {
-		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6")).Render("> Cardinal [thinking]") +
-			"\n" +
-			lipgloss.NewStyle().PaddingLeft(4).Width(max(m.width-4, 20)).Render(thinking)
+		blocks = append(blocks, lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("8")).Render("> Cardinal [thinking]"))
+		blocks = append(blocks, lipgloss.NewStyle().PaddingLeft(4).Width(max(m.width-4, 20)).Italic(true).Foreground(lipgloss.Color("8")).Render(thinking))
 	}
 
+	// Render streaming section if present
 	if streaming != "" {
-		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("5")).Render("> Cardinal [streaming]") +
-			"\n" +
-			lipgloss.NewStyle().PaddingLeft(4).Width(max(m.width-4, 20)).Render(streaming)
+		blocks = append(blocks, lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("5")).Render("> Cardinal"))
+		blocks = append(blocks, lipgloss.NewStyle().PaddingLeft(4).Width(max(m.width-4, 20)).Render(streaming))
 	}
 
-	return ""
+	if len(blocks) == 0 {
+		return ""
+	}
+
+	return strings.Join(blocks, "\n")
 }
 
 func (m Model) renderSuggestions() string {

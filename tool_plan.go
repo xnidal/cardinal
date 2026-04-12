@@ -13,15 +13,6 @@ func defaultToolApprovals(toolCalls []api.ToolCall) []bool {
 	return approvals
 }
 
-func hasPendingApprovals(toolCalls []api.ToolCall) bool {
-	for _, toolCall := range toolCalls {
-		if tools.RequiresApproval(toolCall.Function.Name) {
-			return true
-		}
-	}
-	return false
-}
-
 func executeToolPlan(working string, toolCalls []api.ToolCall, approvals []bool, onEditSoul func()) []tools.ToolResult {
 	handler := tools.NewToolHandler(working, onEditSoul)
 	results := make([]tools.ToolResult, 0, len(toolCalls))

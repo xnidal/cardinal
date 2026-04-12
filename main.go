@@ -3,8 +3,11 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"flag"
 	"fmt"
+	"math"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -27,10 +30,18 @@ func convertToolDefs(defs []any) []api.Tool {
 }
 
 func main() {
+	modelFlag := flag.String("model", "", "model to use for this session")
+	flag.Parse()
+
 	cfg := config.Load()
 
-	if len(os.Args) > 1 {
-		runCLI(cfg, strings.Join(os.Args[1:], " "))
+	if *modelFlag != "" {
+		cfg.Model = *modelFlag
+	}
+
+	args := flag.Args()
+	if len(args) > 0 {
+		runCLI(cfg, strings.Join(args, " "))
 		return
 	}
 
@@ -44,6 +55,7 @@ func main() {
 func runCLI(cfg *config.Config, prompt string) {
 	working, _ := os.Getwd()
 	systemPrompt := cfg.SystemPrompt + "\n\nWorking directory: " + working
+	systemPrompt += "\n\nWhen using tools, you MUST use the standard function calling format with JSON arguments. Do NOT use XML tags like <tool_call>. Use the provided tool definitions through the proper API function calling mechanism."
 
 	messages := []api.Message{
 		{Role: "system", Content: systemPrompt},
@@ -55,8 +67,11 @@ func runCLI(cfg *config.Config, prompt string) {
 
 	fmt.Printf("Cardinal [%s]\n\n", cfg.ActiveProfileName())
 
-	maxRetries := 3
+	maxRetries := 5
 	retryCount := 0
+	baseDelay := 1 * time.Second
+	lastToolCalls := ""
+	repeatedCallCount := 0
 
 	for {
 		messages = compressMessagesCLI(messages)
@@ -72,6 +87,8 @@ func runCLI(cfg *config.Config, prompt string) {
 			case "content":
 				fmt.Print(event.Content)
 				fullContent += event.Content
+			case "thinking":
+				// Thinking content is captured but not displayed in CLI mode
 			case "tool_call":
 				if event.Tool != nil && event.Tool.Function.Name != "" {
 					toolCalls = append(toolCalls, *event.Tool)
@@ -82,15 +99,14 @@ func runCLI(cfg *config.Config, prompt string) {
 		}
 
 		if streamErr != nil {
-			if apiErr, ok := streamErr.(*api.APIError); ok && apiErr.StatusCode == 429 && retryCount < maxRetries {
+			if shouldRetryCLI(streamErr, retryCount, maxRetries) {
 				retryCount++
-				waitTime := time.Duration(retryCount) * 2
-				fmt.Fprintf(os.Stderr, "\nRate limited. Retrying in %ds (attempt %d/%d)...\n", waitTime, retryCount, maxRetries)
-				time.Sleep(waitTime * time.Second)
-				messages = []api.Message{
-					{Role: "system", Content: systemPrompt},
-					{Role: "user", Content: prompt},
+				delay := time.Duration(float64(baseDelay) * math.Pow(2, float64(retryCount-1)))
+				if delay > 30*time.Second {
+					delay = 30 * time.Second
 				}
+				fmt.Fprintf(os.Stderr, "\nError: %v. Retrying in %v (attempt %d/%d)...\n", formatCLIError(streamErr), delay, retryCount, maxRetries)
+				time.Sleep(delay)
 				continue
 			}
 			fmt.Fprintf(os.Stderr, "Error: %v\n", streamErr)
@@ -99,10 +115,42 @@ func runCLI(cfg *config.Config, prompt string) {
 
 		retryCount = 0
 
+		// Check for XML-formatted tool calls in content
+		xmlToolCallPattern := regexp.MustCompile(`(<tool_call>[a-z_]+\s|<tool_call[^>]*name\s*=\s*["'][^"']+["'][^>]*>)`)
+		if xmlToolCallPattern.MatchString(fullContent) {
+			messages = append(messages, api.Message{
+				Role:    "assistant",
+				Content: fullContent,
+			})
+			messages = append(messages, api.Message{
+				Role:       "tool",
+				ToolCallID: "format_error",
+				Content:    "Error: Your message was ignored because it contained XML-formatted tool calls. You MUST use the proper function calling API with JSON format. Do NOT write tool calls as text in your message. The system will handle tool execution for you. Just respond normally and the tools will be called automatically through the API.",
+			})
+			fmt.Println("\n[Warning: XML tool call format detected - message ignored]")
+			continue
+		}
+
 		if len(toolCalls) == 0 {
 			fmt.Println()
 			break
 		}
+
+		// Check for repeated identical tool calls to break loops
+		toolCallSummary := ""
+		for _, tc := range toolCalls {
+			toolCallSummary += tc.Function.Name + ":" + tc.Function.Arguments + "|"
+		}
+		if toolCallSummary == lastToolCalls {
+			repeatedCallCount++
+			if repeatedCallCount >= 2 {
+				fmt.Println("\n[Breaking loop: same tool calls repeated]")
+				break
+			}
+		} else {
+			repeatedCallCount = 0
+		}
+		lastToolCalls = toolCallSummary
 
 		fmt.Println()
 		approvals := promptForToolApprovals(toolCalls)
@@ -118,9 +166,9 @@ func runCLI(cfg *config.Config, prompt string) {
 			formatted := tools.FormatToolResultCLI(results[i], toolCall.Function.Name, toolCall.Function.Arguments)
 			fmt.Println(formatted)
 			messages = append(messages, api.Message{
-				Role:    "tool",
-				Name:    toolCall.Function.Name,
-				Content: tools.FormatToolResult(results[i]),
+				Role:       "tool",
+				ToolCallID: toolCall.ID,
+				Content:    tools.FormatToolResult(results[i]),
 			})
 		}
 
@@ -200,4 +248,44 @@ func estimateTokensCLI(messages []api.Message) int {
 		total += 10
 	}
 	return total
+}
+
+func shouldRetryCLI(err error, retryCount, maxRetries int) bool {
+	if err == nil || retryCount >= maxRetries {
+		return false
+	}
+
+	if apiErr, ok := err.(*api.APIError); ok {
+		switch apiErr.StatusCode {
+		case 408, 429, 500, 502, 503, 504:
+			return true
+		}
+	}
+
+	return true
+}
+
+func formatCLIError(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	if apiErr, ok := err.(*api.APIError); ok {
+		switch apiErr.StatusCode {
+		case 429:
+			return "Rate limited"
+		case 500:
+			return "Server error"
+		case 502:
+			return "Bad gateway"
+		case 503:
+			return "Service unavailable"
+		case 504:
+			return "Gateway timeout"
+		default:
+			return fmt.Sprintf("API error (%d): %s", apiErr.StatusCode, apiErr.Message)
+		}
+	}
+
+	return err.Error()
 }

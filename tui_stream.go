@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -202,7 +203,7 @@ func (m Model) getSystemPrompt() string {
 	if systemPrompt == "" {
 		systemPrompt = "You are Cardinal, a helpful coding assistant. Be concise and direct."
 	}
-	return systemPrompt + "\n\nWorking directory: " + m.working
+	return systemPrompt + "\n\nWorking directory: " + m.working + "\n\nWhen using tools, you MUST use the standard function calling format with JSON arguments. Do NOT use XML tags like <tool_call>. Use the provided tool definitions through the proper API function calling mechanism."
 }
 
 func (m Model) beginStream() (tea.Model, tea.Cmd) {
@@ -367,19 +368,24 @@ func formatError(err error) string {
 
 // addAssistantMessage adds an assistant message to the history, avoiding duplicates
 func (m *Model) addAssistantMessage(content string, toolCalls ...api.ToolCall) {
-	if strings.TrimSpace(content) == "" && len(toolCalls) == 0 {
+	m.addAssistantMessageWithThinking(content, "", toolCalls...)
+}
+
+// addAssistantMessageWithThinking adds an assistant message with separate thinking content
+func (m *Model) addAssistantMessageWithThinking(content, thinking string, toolCalls ...api.ToolCall) {
+	if strings.TrimSpace(content) == "" && strings.TrimSpace(thinking) == "" && len(toolCalls) == 0 {
 		return
 	}
 
 	// Skip if the last message has the exact same content
 	if len(m.messages) > 0 {
 		lastMsg := m.messages[len(m.messages)-1]
-		if lastMsg.Role == "assistant" && lastMsg.Content == content {
+		if lastMsg.Role == "assistant" && lastMsg.Content == content && lastMsg.Thinking == thinking {
 			return
 		}
 	}
 
-	msg := api.Message{Role: "assistant", Content: content}
+	msg := api.Message{Role: "assistant", Content: content, Thinking: thinking}
 	if len(toolCalls) > 0 {
 		msg.ToolCalls = toolCalls
 	}
@@ -388,12 +394,16 @@ func (m *Model) addAssistantMessage(content string, toolCalls ...api.ToolCall) {
 }
 
 // addToolResult adds a tool result message to the history
-func (m *Model) addToolResult(name, content string) {
-	m.messages = append(m.messages, api.Message{
+func (m *Model) addToolResult(name, content string, args ...string) {
+	msg := api.Message{
 		Role:    "tool",
 		Name:    name,
 		Content: content,
-	})
+	}
+	if len(args) > 0 {
+		msg.ToolArgs = args[0]
+	}
+	m.messages = append(m.messages, msg)
 	m.lastMessages = append([]api.Message(nil), m.messages...)
 }
 
@@ -402,20 +412,31 @@ func (m *Model) finalizeUIMessageHandling() {
 	m.scrollOffset = 0
 	m.useViewport = true
 	m.updateViewportContent()
-	m.viewport.GotoBottom()
+	// Only scroll to bottom if content is taller than viewport
+	if m.viewport.TotalLineCount() > m.viewport.Height {
+		m.viewport.GotoBottom()
+	}
 }
 
 func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 	m.streamCh = nil
 
-	// Build assistant message content
-	msgContent := m.streaming
+	// Check for XML-formatted tool calls in content
+	fullContent := m.streaming
 	if m.thinking != "" {
-		msgContent = m.thinking + "\n\n" + m.streaming
+		fullContent = m.thinking + "\n\n" + m.streaming
+	}
+	xmlToolCallPattern := regexp.MustCompile(`(<tool_call>[a-z_]+\s|<tool_call[^>]*name\s*=\s*["'][^"']+["'][^>]*>)`)
+	if xmlToolCallPattern.MatchString(fullContent) {
+		m.addAssistantMessageWithThinking(fullContent, "")
+		m.addToolResult("format_error", "Error: Your message was ignored because it contained XML-formatted tool calls. You MUST use the proper function calling API with JSON format. Do NOT write tool calls as text in your message. The system will handle tool execution for you. Just respond normally and the tools will be called automatically through the API.")
+		m.finalizeUIMessageHandling()
+		return m.beginStream()
 	}
 
 	if len(m.pendingToolCalls) > 0 {
 		toolCalls := append([]api.ToolCall(nil), m.pendingToolCalls...)
+		streamingContent := m.streaming
 		m.streaming = ""
 		m.thinking = ""
 		m.pendingToolCalls = nil
@@ -442,7 +463,7 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 			}
 			m.busy = true
 			m.setStatus("Running tools")
-			return m, m.executeToolPlanCmd(msgContent, toolCalls, approvals)
+			return m, m.executeToolPlanCmd(streamingContent, toolCalls, approvals)
 		}
 
 		// If we have auto-approved tools, execute them first
@@ -453,12 +474,12 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 			}
 			m.busy = true
 			m.setStatus("Running tools")
-			return m, m.executeToolPlanCmd(msgContent, toolCalls, approvals)
+			return m, m.executeToolPlanCmd(streamingContent, toolCalls, approvals)
 		}
 
 		// All tools need approval
 		m.mode = "permissions"
-		m.modeData = newPermissionMode(msgContent, toolCalls)
+		m.modeData = newPermissionMode(streamingContent, toolCalls)
 		m.busy = false
 		m.setStatus("Tool approval required")
 		return m, nil
@@ -466,14 +487,20 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 
 	// Only add message if we have content
 	// Clear streaming/thinking BEFORE adding to avoid duplicates
-	if strings.TrimSpace(msgContent) != "" {
-		m.streaming = ""
-		m.thinking = ""
-		m.addAssistantMessage(msgContent)
+	streamingContent := strings.TrimSpace(m.streaming)
+	thinkingContent := strings.TrimSpace(m.thinking)
+	m.streaming = ""
+	m.thinking = ""
+
+	if streamingContent != "" || thinkingContent != "" {
+		// If we only have thinking, store it as thinking only (empty content)
+		// If we have both, store them separately
+		if streamingContent == "" && thinkingContent != "" {
+			m.addAssistantMessageWithThinking("", thinkingContent)
+		} else {
+			m.addAssistantMessageWithThinking(streamingContent, thinkingContent)
+		}
 		m.finalizeUIMessageHandling()
-	} else {
-		m.streaming = ""
-		m.thinking = ""
 	}
 
 	m.busy = false
@@ -507,10 +534,12 @@ func (m Model) handleToolExecution(msg toolExecutionMsg) (tea.Model, tea.Cmd) {
 	// Add tool results
 	for i, result := range msg.results {
 		name := result.Name
+		var args string
 		if i < len(msg.toolCalls) && msg.toolCalls[i].Function.Name != "" {
 			name = msg.toolCalls[i].Function.Name
+			args = msg.toolCalls[i].Function.Arguments
 		}
-		m.addToolResult(name, tools.FormatToolResult(result))
+		m.addToolResult(name, tools.FormatToolResult(result), args)
 	}
 
 	m.setStatus("Continuing after tool results")

@@ -125,6 +125,12 @@ func (m Model) handleSlashCommand(cmd string) (tea.Model, tea.Cmd) {
 		m.status = "Ready"
 		return m, nil
 
+	case "/tools":
+		toolList := "Available tools:\n• bash - Execute bash commands\n• read_file - Read file contents\n• write_file - Write/create files\n• edit_file - Find & replace in files\n• list_files - List directory contents\n• grep - Search file contents\n• glob - Find files by pattern\n• file_info - Get file metadata\n• calculate - Evaluate math expressions\n• edit_soul - Edit agent's SOUL.md\n• subagent - Launch sub-agent tasks\n• todo_add/list/update/remove - Task management"
+		m.messages = append(m.messages, api.Message{Role: "assistant", Content: toolList})
+		m.status = "Ready"
+		return m, nil
+
 	default:
 		m.err = fmt.Errorf("unknown command: %s", cmd)
 		return m, nil

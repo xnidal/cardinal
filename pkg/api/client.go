@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -9,10 +11,13 @@ import (
 )
 
 type Message struct {
-	Role      string     `json:"role"`
-	Content   string     `json:"content"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
-	Name      string     `json:"name,omitempty"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	Thinking   string     `json:"thinking,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	Name       string     `json:"name,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	ToolArgs   string     `json:"tool_args,omitempty"`
 }
 
 type ToolCall struct {
@@ -98,19 +103,25 @@ func (c *Client) ChatStreamChannel(model string, messages []Message, tools []Too
 			case "user":
 				chatMessages[i] = openai.UserMessage(msg.Content)
 			case "assistant":
-				chatMessages[i] = openai.AssistantMessage(msg.Content)
+				if msg.Thinking != "" {
+					combined := "<thinking>\n" + msg.Thinking + "\n</thinking>\n\n" + msg.Content
+					chatMessages[i] = openai.AssistantMessage(combined)
+				} else {
+					chatMessages[i] = openai.AssistantMessage(msg.Content)
+				}
 			case "system":
 				chatMessages[i] = openai.SystemMessage(msg.Content)
 			case "tool":
-				chatMessages[i] = openai.ToolMessage(msg.Name, msg.Content)
+				chatMessages[i] = openai.ToolMessage(msg.Content, msg.ToolCallID)
 			default:
 				chatMessages[i] = openai.UserMessage(msg.Content)
 			}
 		}
 
 		params := openai.ChatCompletionNewParams{
-			Messages: chatMessages,
-			Model:    openai.ChatModel(model),
+			Messages:  chatMessages,
+			Model:     openai.ChatModel(model),
+			MaxTokens: openai.Int(4096),
 			StreamOptions: openai.ChatCompletionStreamOptionsParam{
 				IncludeUsage: openai.Bool(true),
 			},
@@ -164,6 +175,17 @@ func (c *Client) ChatStreamChannel(model string, messages []Message, tools []Too
 
 			if choice.Delta.Content != "" {
 				ch <- StreamEvent{Type: "content", Content: choice.Delta.Content}
+			}
+
+			// Handle reasoning_content field (for models like z-ai/glm4.7)
+			raw := choice.Delta.RawJSON()
+			if strings.Contains(raw, `"reasoning_content":`) {
+				var delta struct {
+					ReasoningContent string `json:"reasoning_content"`
+				}
+				if err := json.Unmarshal([]byte(raw), &delta); err == nil && delta.ReasoningContent != "" {
+					ch <- StreamEvent{Type: "thinking", Thinking: delta.ReasoningContent}
+				}
 			}
 
 			for _, deltaToolCall := range choice.Delta.ToolCalls {
@@ -225,7 +247,12 @@ func (c *Client) Chat(model string, messages []Message, tools []Tool) (Message, 
 		case "user":
 			chatMessages[i] = openai.UserMessage(msg.Content)
 		case "assistant":
-			chatMessages[i] = openai.AssistantMessage(msg.Content)
+			if msg.Thinking != "" {
+				combined := "<thinking>\n" + msg.Thinking + "\n</thinking>\n\n" + msg.Content
+				chatMessages[i] = openai.AssistantMessage(combined)
+			} else {
+				chatMessages[i] = openai.AssistantMessage(msg.Content)
+			}
 		case "system":
 			chatMessages[i] = openai.SystemMessage(msg.Content)
 		case "tool":

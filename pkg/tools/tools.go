@@ -87,6 +87,9 @@ func PermissionDeniedResult(name string) ToolResult {
 }
 
 func SummarizeCall(name, args string) string {
+	if todo := summarizeTodoCall(name, args); todo != "" {
+		return todo
+	}
 	switch name {
 	case "bash":
 		var params struct {
@@ -334,7 +337,7 @@ func (th *ToolHandler) executeWriteFile(args string) ToolResult {
 	if strings.TrimSpace(params.Path) == "" {
 		return ToolResult{Name: "write_file", Success: false, Error: "Missing required parameter 'path'. Usage: {\"path\": \"filename.go\", \"content\": \"file content\"}"}
 	}
-	if params.Content == "" {
+	if strings.TrimSpace(params.Content) == "" {
 		return ToolResult{Name: "write_file", Success: false, Error: "Missing required parameter 'content'. Usage: {\"path\": \"filename.go\", \"content\": \"file content\"}"}
 	}
 
@@ -364,7 +367,7 @@ func (th *ToolHandler) executeEditFile(args string) ToolResult {
 	if strings.TrimSpace(params.Path) == "" {
 		return ToolResult{Name: "edit_file", Success: false, Error: "Missing required parameter 'path'. Usage: {\"path\": \"filename.go\", \"find\": \"text to find\", \"replace\": \"new text\"}"}
 	}
-	if params.Find == "" {
+	if strings.TrimSpace(params.Find) == "" {
 		return ToolResult{Name: "edit_file", Success: false, Error: "Missing required parameter 'find'. Usage: {\"path\": \"filename.go\", \"find\": \"text to find\", \"replace\": \"new text\"}"}
 	}
 
@@ -561,7 +564,14 @@ func (th *ToolHandler) executeGlob(args string) ToolResult {
 		return ToolResult{Name: "glob", Success: false, Error: err.Error()}
 	}
 
-	matches, err := filepath.Glob(filepath.Join(fullPath, pattern))
+	var matches []string
+
+	// Handle recursive glob patterns with **
+	if strings.Contains(pattern, "**") {
+		matches, err = globRecursive(fullPath, pattern)
+	} else {
+		matches, err = filepath.Glob(filepath.Join(fullPath, pattern))
+	}
 	if err != nil {
 		return ToolResult{Name: "glob", Success: false, Error: err.Error()}
 	}
@@ -576,12 +586,45 @@ func (th *ToolHandler) executeGlob(args string) ToolResult {
 		info, _ := os.Stat(match)
 		prefix := "[FILE] "
 		if info.IsDir() {
-			prefix = "[DIR]  "
+			prefix = "[DIR] "
 		}
 		results = append(results, prefix+relPath)
 	}
 
 	return ToolResult{Name: "glob", Success: true, Output: strings.Join(results, "\n"), Path: searchPath}
+}
+
+func globRecursive(basePath, pattern string) ([]string, error) {
+	var matches []string
+
+	parts := strings.Split(pattern, "**")
+	if len(parts) < 2 {
+		return filepath.Glob(filepath.Join(basePath, pattern))
+	}
+
+	err := filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info == nil {
+			return nil
+		}
+
+		suffix := parts[len(parts)-1]
+		suffix = strings.TrimPrefix(suffix, string(filepath.Separator))
+
+		matched, err := filepath.Match(suffix, filepath.Base(path))
+		if err != nil {
+			return nil
+		}
+		if matched {
+			matches = append(matches, path)
+		}
+
+		return nil
+	})
+
+	return matches, err
 }
 
 func (th *ToolHandler) executeFileInfo(args string) ToolResult {
@@ -643,20 +686,68 @@ func evaluateExpression(expr string) string {
 		return "Error: empty expression"
 	}
 
+	// Handle factorial - find the number immediately before !
 	if strings.Contains(expr, "!") {
-		parts := strings.Split(expr, "!")
-		if len(parts) == 2 && parts[1] == "" {
-			n, err := strconv.Atoi(parts[0])
-			if err != nil {
-				return fmt.Sprintf("Error: could not parse '%s' as number", parts[0])
+		idx := strings.Index(expr, "!")
+		if idx > 0 {
+			// Find the number/expression immediately before !
+			// Walk backwards to find the start of the factorial operand
+			start := idx - 1
+			for start >= 0 {
+				c := expr[start]
+				if (c >= '0' && c <= '9') || c == '.' || c == ')' {
+					start--
+				} else {
+					break
+				}
 			}
+			start++ // Move forward to the first character of the number
+
+			// Handle parentheses - find matching opening paren
+			if start < idx && expr[idx-1] == ')' {
+				// Find matching opening paren
+				parenCount := 1
+				parenStart := idx - 2
+				for parenStart >= 0 && parenCount > 0 {
+					if expr[parenStart] == ')' {
+						parenCount++
+					} else if expr[parenStart] == '(' {
+						parenCount--
+					}
+					parenStart--
+				}
+				start = parenStart + 1
+			}
+
+			beforeFactorial := expr[start:idx]
+			afterFactorial := expr[idx+1:]
+			prefix := expr[:start]
+
+			// Evaluate the part before !
+			beforeResult := eval(beforeFactorial)
+			if strings.HasPrefix(beforeResult, "Error:") {
+				return beforeResult
+			}
+
+			// Parse the result as an integer for factorial
+			var n int
+			_, err := fmt.Sscanf(beforeResult, "%d", &n)
+			if err != nil {
+				return fmt.Sprintf("Error: could not parse '%s' (result: %s) as integer for factorial", beforeFactorial, beforeResult)
+			}
+
 			if n < 0 {
 				return "Error: factorial of negative number"
 			}
 			if n > 10000 {
 				return "Error: factorial too large"
 			}
-			return factorial(n).String()
+
+			factResult := factorial(n).String()
+
+			// Rebuild the expression with the factorial result
+			newExpr := prefix + factResult + afterFactorial
+			return eval(newExpr)
 		}
 	}
 
@@ -1003,17 +1094,8 @@ func (th *ToolHandler) resolvePath(path string) (string, error) {
 
 func FormatToolResult(result ToolResult) string {
 	var output strings.Builder
-	if result.Success {
-		output.WriteString(fmt.Sprintf("[%s]\n", result.Name))
-	} else {
+	if !result.Success {
 		output.WriteString(fmt.Sprintf("[%s] Error: ", result.Name))
-	}
-	if result.Path != "" {
-		output.WriteString(fmt.Sprintf("%s", result.Path))
-		if result.Lines != "" {
-			output.WriteString(fmt.Sprintf(" (%s)", result.Lines))
-		}
-		output.WriteString("\n")
 	}
 	if result.Output != "" {
 		output.WriteString(result.Output)
@@ -1123,7 +1205,11 @@ func FormatToolResultCLI(result ToolResult, toolName, args string) string {
 			Expression string `json:"expression"`
 		}
 		if json.Unmarshal([]byte(args), &params) == nil {
-			toolLabel = "calculate: " + params.Expression
+			if result.Success && result.Output != "" {
+				toolLabel = "calculate " + params.Expression + " = " + result.Output
+			} else {
+				toolLabel = "calculate: " + params.Expression
+			}
 		} else {
 			toolLabel = "calculate"
 		}
@@ -1156,7 +1242,7 @@ func FormatToolResultCLI(result ToolResult, toolName, args string) string {
 }
 
 func GetToolDefinitions() []any {
-	return []any{
+	defs := []any{
 		map[string]any{
 			"type": "function",
 			"function": map[string]any{
@@ -1358,6 +1444,7 @@ func GetToolDefinitions() []any {
 			},
 		},
 	}
+	return append(defs, getTodoToolDefinitions()...)
 }
 
 func truncate(value string, limit int) string {

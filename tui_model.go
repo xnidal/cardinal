@@ -12,7 +12,9 @@ import (
 	"cardinal/pkg/storage"
 	"cardinal/pkg/tools"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -20,7 +22,7 @@ import (
 )
 
 type Model struct {
-	input            textinput.Model
+	input            textarea.Model
 	spinner          spinner.Model
 	messages         []api.Message
 	streaming        string
@@ -72,11 +74,22 @@ var slashCommands = []string{
 }
 
 func NewModel(cfg *config.Config) Model {
-	ti := textinput.New()
-	ti.Placeholder = "Message Cardinal or type /help"
-	ti.Focus()
-	ti.CharLimit = 4000
-	ti.Width = 60
+	ta := textarea.New()
+	ta.Placeholder = "Message Cardinal or type /help"
+	ta.Focus()
+	ta.SetWidth(60)
+	ta.SetHeight(1)
+	ta.ShowLineNumbers = false
+	ta.Prompt = ""
+	ta.CharLimit = 4000
+	// Remove background styling
+	ta.FocusedStyle.Base = lipgloss.NewStyle()
+	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
+	ta.FocusedStyle.Placeholder = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	ta.FocusedStyle.Text = lipgloss.NewStyle()
+	ta.BlurredStyle = ta.FocusedStyle
+	// Disable newline insertion
+	ta.KeyMap.InsertNewline = key.NewBinding()
 
 	s := spinner.New()
 	s.Spinner = spinner.Dot
@@ -88,7 +101,7 @@ func NewModel(cfg *config.Config) Model {
 	vp.SetContent("")
 
 	return Model{
-		input:        ti,
+		input:        ta,
 		spinner:      s,
 		client:       api.NewClient(cfg.APIURL, cfg.APIKey),
 		toolDefs:     convertToolDefs(tools.GetToolDefinitions()),
@@ -120,7 +133,7 @@ func loadSoul() string {
 }
 
 func (m Model) Init() tea.Cmd {
-	return textinput.Blink
+	return textarea.Blink
 }
 
 func startSpinnerTicker() tea.Cmd {
@@ -237,27 +250,26 @@ func (m Model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case tea.KeyEnter:
-		value := strings.TrimSpace(m.input.Value())
-		if value == "" {
-			return m, nil
+		if m.mode == "" && !m.busy {
+			value := strings.TrimSpace(m.input.Value())
+			if value == "" {
+				return m, nil
+			}
+			if strings.HasPrefix(value, "/") {
+				return m.handleSlashCommand(value)
+			}
+			m.err = nil
+			m.retryCount = 0
+			m.messages = append(m.messages, api.Message{Role: "user", Content: value})
+			m.lastMessages = append([]api.Message(nil), m.messages...)
+			m.promptHistory = append(m.promptHistory, value)
+			m.historyIndex = len(m.promptHistory)
+			m.input.SetValue("")
+			m.suggestions = nil
+			m.scrollOffset = 0
+			m.useViewport = false
+			return m.beginStream()
 		}
-		if strings.HasPrefix(value, "/") {
-			return m.handleSlashCommand(value)
-		}
-		if m.busy {
-			return m, nil
-		}
-		m.err = nil
-		m.retryCount = 0
-		m.messages = append(m.messages, api.Message{Role: "user", Content: value})
-		m.lastMessages = append([]api.Message(nil), m.messages...)
-		m.promptHistory = append(m.promptHistory, value)
-		m.historyIndex = len(m.promptHistory)
-		m.input.SetValue("")
-		m.suggestions = nil
-		m.scrollOffset = 0
-		m.useViewport = false
-		return m.beginStream()
 
 	case tea.KeyTab:
 		if len(m.suggestions) > 0 {
@@ -380,13 +392,20 @@ func slicesEqual(a, b []string) bool {
 func (m *Model) resize(width, height int) {
 	m.width = width
 	m.height = height
-	m.input.Width = max(width-6, 20)
+	m.input.SetWidth(max(width-6, 20))
+	m.input.SetHeight(1)
 
-	// Calculate viewport height (total height minus header, input, footer, and padding)
-	headerHeight := 4 // header + blank line
-	inputHeight := 2  // input + newline
-	footerHeight := 2 // footer hint
-	viewportHeight := height - headerHeight - inputHeight - footerHeight
+	// Calculate viewport height (total height minus fixed elements)
+	// Cardinal header: 1 line + 1 margin = 2
+	// Empty line before input: 1
+	// Input: 1 line
+	// Footer: 1 line
+	// Total fixed: 5
+	headerHeight := 2
+	spacingHeight := 1 // empty line before input
+	inputHeight := 3   // textarea is taller than textinput
+	footerHeight := 1
+	viewportHeight := height - headerHeight - spacingHeight - inputHeight - footerHeight
 	if viewportHeight < 5 {
 		viewportHeight = 5
 	}
