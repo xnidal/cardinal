@@ -62,6 +62,7 @@ type Model struct {
 var slashCommands = []string{
 	"/help",
 	"/clear",
+	"/new",
 	"/undo",
 	"/soul",
 	"/models",
@@ -174,12 +175,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case spinner.TickMsg:
 		m.spinner, _ = m.spinner.Update(msg)
-		if m.busy && m.status != "" && m.status != m.lastStatus {
-			m.thinkingIdx++
-			if m.thinkingIdx >= len(thinkingMessages) {
-				m.thinkingIdx = 0
+		if m.busy && m.status != "" {
+			currentPriority := getStatusPriority(m.status)
+			if currentPriority >= 3 {
+				m.thinkingIdx++
+				if m.thinkingIdx >= len(thinkingMessages) {
+					m.thinkingIdx = 0
+				}
+				m.status = thinkingMessages[m.thinkingIdx]
 			}
-			m.status = thinkingMessages[m.thinkingIdx]
 		}
 		m.lastStatus = m.status
 		if m.busy {

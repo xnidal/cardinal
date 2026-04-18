@@ -41,6 +41,7 @@ type profileFormMode struct {
 
 type permissionMode struct {
 	assistantContent string
+	thinkingContent  string
 	toolCalls        []api.ToolCall
 	approvals        []bool
 	selected         int
@@ -53,7 +54,7 @@ func (m Model) handleSlashCommand(cmd string) (tea.Model, tea.Cmd) {
 	m.err = nil
 
 	switch cmd {
-	case "/clear":
+	case "/clear", "/new":
 		m.messages = nil
 		m.streaming = ""
 		m.pendingToolCalls = nil
@@ -483,7 +484,7 @@ func (m Model) updatePermissionsMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.modeData = nil
 			m.busy = true
 			m.status = "Continuing without tool execution"
-			return m, m.executeToolPlanCmd(data.assistantContent, data.toolCalls, approvals)
+			return m, m.executeToolPlanCmd(data.assistantContent, data.thinkingContent, data.toolCalls, approvals)
 
 		case tea.KeyUp:
 			if data.selected > 0 {
@@ -513,7 +514,7 @@ func (m Model) updatePermissionsMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.status = "Running approved tools"
 			}
-			return m, m.executeToolPlanCmd(data.assistantContent, data.toolCalls, approvals)
+			return m, m.executeToolPlanCmd(data.assistantContent, data.thinkingContent, data.toolCalls, approvals)
 		}
 
 		switch msg.String() {
@@ -613,10 +614,11 @@ func nextFormIndex(current, total int, key tea.KeyType) int {
 	}
 }
 
-func newPermissionMode(assistantContent string, toolCalls []api.ToolCall) *permissionMode {
+func newPermissionMode(assistantContent, thinkingContent string, toolCalls []api.ToolCall) *permissionMode {
 	return &permissionMode{
 		assistantContent: assistantContent,
-		toolCalls:        append([]api.ToolCall(nil), toolCalls...),
-		approvals:        defaultToolApprovals(toolCalls),
+		thinkingContent:  thinkingContent,
+		toolCalls: append([]api.ToolCall(nil), toolCalls...),
+		approvals: defaultToolApprovals(toolCalls),
 	}
 }

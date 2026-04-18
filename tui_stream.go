@@ -65,6 +65,7 @@ type streamRetryMsg struct {
 
 type toolExecutionMsg struct {
 	assistantContent string
+	thinkingContent  string
 	toolCalls        []api.ToolCall
 	results          []tools.ToolResult
 }
@@ -122,6 +123,11 @@ func (m Model) estimateTokens(messages []api.Message) int {
 	for _, msg := range messages {
 		total += len(msg.Content) / 4
 		total += len(msg.Role) / 4
+		// Account for thinking content - it gets wrapped in <thinking> tags when sent
+		if msg.Thinking != "" {
+			total += len(msg.Thinking) / 4
+			total += 5 // for <thinking> and </thinking> tags + newlines
+		}
 		for _, tc := range msg.ToolCalls {
 			total += len(tc.Function.Name) / 4
 			total += len(tc.Function.Arguments) / 4
@@ -177,6 +183,10 @@ func (m Model) doCompress(messages []api.Message) []api.Message {
 	for i := 1; i < summaryEnd; i++ {
 		msg := messages[i]
 		content := msg.Content
+		// Include thinking in the summary if present
+		if msg.Thinking != "" {
+			content = "<thinking>" + msg.Thinking + "</thinking> " + content
+		}
 		if len(content) > 100 {
 			content = content[:100] + "..."
 		}
@@ -224,7 +234,33 @@ func (m *Model) setStatus(newStatus string) {
 		return
 	}
 	m.errorStatus = ""
-	m.status = newStatus
+	// priority: higher priority statuses override lower ones
+	// [riority levels:
+	//   0 - error (always shown)
+	//   1 - writing tool call, Retrying (very specific)
+	//   2 - receiving response (specific)
+	//   3 - thinking (generic, lowest priority)
+	newPriority := getStatusPriority(newStatus)
+	currentPriority := getStatusPriority(m.status)
+	if newPriority <= currentPriority {
+		m.status = newStatus
+	}
+}
+
+func getStatusPriority(status string) int {
+	lower := strings.ToLower(status)
+	switch {
+	case strings.Contains(lower, "error"):
+		return 0
+	case strings.Contains(lower, "writing") || strings.Contains(lower, "retrying"):
+		return 1
+	case strings.Contains(lower, "receiving"):
+		return 2
+	case strings.Contains(lower, "thinking") || strings.Contains(lower, "hmm") || strings.Contains(lower, "ponder"):
+		return 3
+	default:
+		return 2
+	}
 }
 
 func (m Model) handleStreamEvent(event api.StreamEvent) (tea.Model, tea.Cmd) {
@@ -422,13 +458,11 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 	m.streamCh = nil
 
 	// Check for XML-formatted tool calls in content
-	fullContent := m.streaming
-	if m.thinking != "" {
-		fullContent = m.thinking + "\n\n" + m.streaming
-	}
-	xmlToolCallPattern := regexp.MustCompile(`(<tool_call>[a-z_]+\s|<tool_call[^>]*name\s*=\s*["'][^"']+["'][^>]*>)`)
-	if xmlToolCallPattern.MatchString(fullContent) {
-		m.addAssistantMessageWithThinking(fullContent, "")
+	xmlToolCallPattern := regexp.MustCompile(`(<[a-z_]+\\s|<tool_call[^>]*name\\s*=\\s*["\'][^"\']+["\'][^>]*>)`)
+	// Check both thinking and streaming for XML patterns
+	if xmlToolCallPattern.MatchString(m.thinking) || xmlToolCallPattern.MatchString(m.streaming) {
+		// Store thinking separately, not duplicated in content
+		m.addAssistantMessageWithThinking(m.streaming, m.thinking)
 		m.addToolResult("format_error", "Error: Your message was ignored because it contained XML-formatted tool calls. You MUST use the proper function calling API with JSON format. Do NOT write tool calls as text in your message. The system will handle tool execution for you. Just respond normally and the tools will be called automatically through the API.")
 		m.finalizeUIMessageHandling()
 		return m.beginStream()
@@ -437,6 +471,7 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 	if len(m.pendingToolCalls) > 0 {
 		toolCalls := append([]api.ToolCall(nil), m.pendingToolCalls...)
 		streamingContent := m.streaming
+		thinkingContent := m.thinking
 		m.streaming = ""
 		m.thinking = ""
 		m.pendingToolCalls = nil
@@ -463,7 +498,7 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 			}
 			m.busy = true
 			m.setStatus("Running tools")
-			return m, m.executeToolPlanCmd(streamingContent, toolCalls, approvals)
+			return m, m.executeToolPlanCmd(streamingContent, thinkingContent, toolCalls, approvals)
 		}
 
 		// If we have auto-approved tools, execute them first
@@ -474,12 +509,12 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 			}
 			m.busy = true
 			m.setStatus("Running tools")
-			return m, m.executeToolPlanCmd(streamingContent, toolCalls, approvals)
+			return m, m.executeToolPlanCmd(streamingContent, thinkingContent, toolCalls, approvals)
 		}
 
 		// All tools need approval
 		m.mode = "permissions"
-		m.modeData = newPermissionMode(streamingContent, toolCalls)
+		m.modeData = newPermissionMode(streamingContent, thinkingContent, toolCalls)
 		m.busy = false
 		m.setStatus("Tool approval required")
 		return m, nil
@@ -508,7 +543,7 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) executeToolPlanCmd(assistantContent string, toolCalls []api.ToolCall, approvals []bool) tea.Cmd {
+func (m Model) executeToolPlanCmd(assistantContent, thinkingContent string, toolCalls []api.ToolCall, approvals []bool) tea.Cmd {
 	working := m.working
 	toolCallsCopy := append([]api.ToolCall(nil), toolCalls...)
 	approvalsCopy := append([]bool(nil), approvals...)
@@ -528,8 +563,7 @@ func (m Model) executeToolPlanCmd(assistantContent string, toolCalls []api.ToolC
 }
 
 func (m Model) handleToolExecution(msg toolExecutionMsg) (tea.Model, tea.Cmd) {
-	// Add assistant message with tool calls
-	m.addAssistantMessage(msg.assistantContent, msg.toolCalls...)
+	m.addAssistantMessageWithThinking(msg.assistantContent, msg.thinkingContent, msg.toolCalls...)
 
 	// Add tool results
 	for i, result := range msg.results {

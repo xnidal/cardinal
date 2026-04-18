@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -41,7 +42,12 @@ func main() {
 
 	args := flag.Args()
 	if len(args) > 0 {
-		runCLI(cfg, strings.Join(args, " "))
+		switch args[0] {
+		case "install":
+			runInstall()
+		case "run":
+			runCLI(cfg, strings.Join(args[1:], " "))
+		}
 		return
 	}
 
@@ -50,6 +56,40 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func runInstall() {
+	execPath, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting executable path: %v\n", err)
+		os.Exit(1)
+	}
+
+	execPath, err = filepath.EvalSymlinks(execPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error resolving symlinks: %v\n", err)
+		os.Exit(1)
+	}
+
+	targetPath := "/usr/local/bin/cardinal"
+
+	execData, err := os.ReadFile(execPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading executable: %v\n", err)
+		os.Exit(1)
+	}
+
+	err = os.WriteFile(targetPath, execData, 0755)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing to %s: %v\n", targetPath, err)
+		fmt.Println("\nYou may need to run this command with sudo:")
+		fmt.Println("  sudo cardinal /install")
+		os.Exit(1)
+	}
+
+	fmt.Println("✓ Cardinal installed successfully!")
+	fmt.Printf("  Location: %s\n", targetPath)
+	fmt.Println("\nYou can now run 'cardinal' from anywhere.")
 }
 
 func runCLI(cfg *config.Config, prompt string) {
@@ -101,10 +141,7 @@ func runCLI(cfg *config.Config, prompt string) {
 		if streamErr != nil {
 			if shouldRetryCLI(streamErr, retryCount, maxRetries) {
 				retryCount++
-				delay := time.Duration(float64(baseDelay) * math.Pow(2, float64(retryCount-1)))
-				if delay > 30*time.Second {
-					delay = 30 * time.Second
-				}
+				delay := min(time.Duration(float64(baseDelay)*math.Pow(2, float64(retryCount-1))), 30*time.Second)
 				fmt.Fprintf(os.Stderr, "\nError: %v. Retrying in %v (attempt %d/%d)...\n", formatCLIError(streamErr), delay, retryCount, maxRetries)
 				time.Sleep(delay)
 				continue
@@ -215,6 +252,10 @@ func compressMessagesCLI(messages []api.Message) []api.Message {
 	for i := 1; i < summaryEnd; i++ {
 		msg := messages[i]
 		content := msg.Content
+		// Include thinking in the summary if present
+		if msg.Thinking != "" {
+			content = "<thinking>" + msg.Thinking + "</thinking> " + content
+		}
 		if len(content) > 150 {
 			content = content[:150] + "..."
 		}
@@ -241,6 +282,11 @@ func estimateTokensCLI(messages []api.Message) int {
 	for _, msg := range messages {
 		total += len(msg.Content) / 4
 		total += len(msg.Role) / 4
+		// Account for thinking content - it gets wrapped in <thinking> tags when sent
+		if msg.Thinking != "" {
+			total += len(msg.Thinking) / 4
+			total += 5 // for <thinking> and </thinking> tags + newlines
+		}
 		for _, tc := range msg.ToolCalls {
 			total += len(tc.Function.Name) / 4
 			total += len(tc.Function.Arguments) / 4

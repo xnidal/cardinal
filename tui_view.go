@@ -341,17 +341,27 @@ func (m Model) renderToolResult(msg api.Message) string {
 	switch toolName {
 	case "read_file":
 		var path string
+		var offset int
+		var limit int
 		if msg.ToolArgs != "" {
 			var params struct {
-				Path string `json:"path"`
+				Path   string `json:"path"`
+				Offset int    `json:"offset,omitempty"`
+				Limit  int    `json:"limit,omitempty"`
 			}
 			if err := json.Unmarshal([]byte(msg.ToolArgs), &params); err == nil {
 				path = params.Path
+				if params.Offset > 0 {
+					offset = params.Offset
+				}
+				if params.Limit > 0 {
+					limit = params.Limit
+				}
 			}
 		}
 		displayPath := m.formatPath(path)
-		linesInfo := extractLinesFromToolResult(msg.Content)
-		if linesInfo != "" {
+		if offset > 0 || limit > 0 {
+			linesInfo := fmt.Sprintf("%d-%d", offset+1, offset+limit)
 			content = lipgloss.NewStyle().
 				Foreground(accentColor).
 				Render("> read " + displayPath + " [" + linesInfo + "]")
@@ -415,10 +425,10 @@ func (m Model) renderToolResult(msg api.Message) string {
 		content = m.formatBashOutput(msg.Content, msg.ToolArgs, maxHeight, maxWidth)
 
 	case "write_file":
-		content = m.formatWriteFileOutput(msg.Content, maxHeight, maxWidth)
+		content = m.formatWriteFileOutput(msg.Content, msg.ToolArgs, maxHeight, maxWidth)
 
 	case "edit_file":
-		content = m.formatEditFileOutput(msg.Content, maxHeight, maxWidth)
+		content = m.formatEditFileOutput(msg.Content, msg.ToolArgs, maxHeight, maxWidth)
 
 	case "grep":
 		content = m.formatGrepOutput(msg.Content, msg.ToolArgs, maxHeight, maxWidth)
@@ -514,13 +524,23 @@ func (m Model) formatBashOutput(content, toolArgs string, maxHeight, maxWidth in
 			Render(strings.Join(formattedLines, "\n"))
 }
 
-func (m Model) formatWriteFileOutput(content string, maxHeight, maxWidth int) string {
-	path := extractPathFromToolResult(content)
+func (m Model) formatWriteFileOutput(content, toolArgs string, maxHeight, maxWidth int) string {
+	// Parse path from tool arguments
+	var path string
+	if toolArgs != "" {
+		var params struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal([]byte(toolArgs), &params); err == nil {
+			path = params.Path
+		}
+	}
+	// Fallback to extracting from content if path not in args
+	if path == "" {
+		path = extractPathFromToolResult(content)
+	}
 	displayPath := m.formatPath(path)
-
-	return lipgloss.NewStyle().
-		Foreground(accentColor).
-		Render("> write " + displayPath)
+	return lipgloss.NewStyle().Foreground(accentColor).Render("> write " + displayPath)
 }
 
 func (m Model) formatCalculateOutput(content, toolArgs string, maxHeight, maxWidth int) string {
@@ -564,8 +584,21 @@ func (m Model) formatCalculateOutput(content, toolArgs string, maxHeight, maxWid
 	return lipgloss.NewStyle().Foreground(accentColor).Render("> calculate")
 }
 
-func (m Model) formatEditFileOutput(content string, maxHeight, maxWidth int) string {
-	path := extractPathFromToolResult(content)
+func (m Model) formatEditFileOutput(content, toolArgs string, maxHeight, maxWidth int) string {
+	// Parse path from tool arguments
+	var path string
+	if toolArgs != "" {
+		var params struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal([]byte(toolArgs), &params); err == nil {
+			path = params.Path
+		}
+	}
+	// Fallback to extracting from content if path not in args
+	if path == "" {
+		path = extractPathFromToolResult(content)
+	}
 	displayPath := m.formatPath(path)
 
 	lines := strings.Split(content, "\n")
@@ -580,43 +613,49 @@ func (m Model) formatEditFileOutput(content string, maxHeight, maxWidth int) str
 		diffLines = append(diffLines[:maxHeight], fmt.Sprintf("... %d more changes", len(lines)-maxHeight))
 	}
 
+	// Build header
+	header := lipgloss.NewStyle().Foreground(accentColor).Render("> edit " + displayPath)
+
 	if len(diffLines) > 0 {
 		var coloredDiff []string
 		for _, line := range diffLines {
 			if strings.HasPrefix(line, "-") {
 				coloredDiff = append(coloredDiff,
-					lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Render("    "+line),
+					lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Render(" "+line),
 				)
 			} else {
 				coloredDiff = append(coloredDiff,
-					lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render("    "+line),
+					lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render(" "+line),
 				)
 			}
 		}
-		return lipgloss.NewStyle().
-			Foreground(accentColor).
-			Render("> edit "+displayPath+"\n") +
-			strings.Join(coloredDiff, "\n")
+		return header + "\n" + strings.Join(coloredDiff, "\n")
 	}
-	return lipgloss.NewStyle().
-		Foreground(accentColor).
-		Render("> edit " + displayPath)
+
+	// No diff lines found - check if it's an error or just no diff
+	if strings.Contains(content, "Error:") || strings.Contains(content, "error") {
+		return header + "\n" + lipgloss.NewStyle().Foreground(errorColor).Render("  (diff not available)")
+	}
+	return header + "\n" + lipgloss.NewStyle().Foreground(dimColor).Render("  (no diff to display)")
 }
 
 func (m Model) formatGrepOutput(content, toolArgs string, maxHeight, maxWidth int) string {
-	// Parse pattern from tool arguments
-	var pattern string
+	// Parse all grep parameters from tool arguments
+	var pattern, path, include string
 	if toolArgs != "" {
 		var params struct {
 			Pattern string `json:"pattern"`
+			Path    string `json:"path"`
+			Include string `json:"include"`
 		}
 		if err := json.Unmarshal([]byte(toolArgs), &params); err == nil {
 			pattern = params.Pattern
+			path = params.Path
+			include = params.Include
 		}
 	}
 
 	lines := strings.Split(content, "\n")
-
 	// Count actual matches
 	matchCount := 0
 	for _, line := range lines {
@@ -625,13 +664,26 @@ func (m Model) formatGrepOutput(content, toolArgs string, maxHeight, maxWidth in
 		}
 	}
 
-	// Build header with pattern and count
-	headerText := "* Grep"
+	// Build header with pattern, include, path, and count
+	var parts []string
 	if pattern != "" {
-		headerText = "* Grep \"" + pattern + "\""
+		parts = append(parts, "\""+pattern+"\"")
+	}
+	if include != "" {
+		parts = append(parts, "in "+include)
+	}
+	if path != "" {
+		parts = append(parts, "("+path+")")
+	}
+
+	headerText := "* Grep"
+	if len(parts) > 0 {
+		headerText += " " + strings.Join(parts, " ")
 	}
 	if matchCount > 0 {
 		headerText += fmt.Sprintf(" (%d match%s)", matchCount, pluralize(matchCount))
+	} else if content == "No matches found" {
+		headerText += " (no matches)"
 	}
 
 	return lipgloss.NewStyle().
