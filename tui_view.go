@@ -634,9 +634,16 @@ func (m Model) formatEditFileOutput(content, toolArgs string, maxHeight, maxWidt
 
 	// No diff lines found - check if it's an error or just no diff
 	if strings.Contains(content, "Error:") || strings.Contains(content, "error") {
-		return header + "\n" + lipgloss.NewStyle().Foreground(errorColor).Render("  (diff not available)")
+		errorContent := content
+		if idx := strings.Index(content, "Error:"); idx >= 0 {
+			errorContent = content[idx:]
+		}
+		return header + "\n" + lipgloss.NewStyle().Foreground(errorColor).Render(errorContent)
 	}
-	return header + "\n" + lipgloss.NewStyle().Foreground(dimColor).Render("  (no diff to display)")
+	if strings.TrimSpace(content) != "" {
+		return header + "\n" + lipgloss.NewStyle().Foreground(dimColor).Render(content)
+	}
+	return header + "\n" + lipgloss.NewStyle().Foreground(dimColor).Render(" (no diff to display)")
 }
 
 func (m Model) formatGrepOutput(content, toolArgs string, maxHeight, maxWidth int) string {

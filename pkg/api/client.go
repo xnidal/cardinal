@@ -90,12 +90,14 @@ func (c *Client) GetOpenAIClient() *openai.Client {
 }
 
 func (c *Client) ChatStreamChannel(model string, messages []Message, tools []Tool) <-chan StreamEvent {
+	return c.ChatStreamChannelCtx(context.Background(), model, messages, tools)
+}
+
+func (c *Client) ChatStreamChannelCtx(ctx context.Context, model string, messages []Message, tools []Tool) <-chan StreamEvent {
 	ch := make(chan StreamEvent, 100)
 
 	go func() {
 		defer close(ch)
-
-		ctx := context.Background()
 
 		chatMessages := make([]openai.ChatCompletionMessageParamUnion, len(messages))
 		for i, msg := range messages {
@@ -154,6 +156,14 @@ func (c *Client) ChatStreamChannel(model string, messages []Message, tools []Too
 		}
 
 		for stream.Next() {
+			// Check if context was cancelled
+			select {
+			case <-ctx.Done():
+				ch <- StreamEvent{Type: "done"}
+				return
+			default:
+			}
+
 			chunk := stream.Current()
 
 			if chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
@@ -200,7 +210,6 @@ func (c *Client) ChatStreamChannel(model string, messages []Message, tools []Too
 						ToolCallName:    deltaToolCall.Function.Name,
 					}
 				}
-
 				if deltaToolCall.ID != "" {
 					current.ID = deltaToolCall.ID
 				}
@@ -210,9 +219,7 @@ func (c *Client) ChatStreamChannel(model string, messages []Message, tools []Too
 				if deltaToolCall.Function.Arguments != "" {
 					current.Function.Arguments += deltaToolCall.Function.Arguments
 				}
-
 				pendingToolCalls[index] = current
-
 				ch <- StreamEvent{
 					Type:            "tool_call_writing",
 					ToolCallWriting: true,
@@ -227,6 +234,11 @@ func (c *Client) ChatStreamChannel(model string, messages []Message, tools []Too
 		}
 
 		if err := stream.Err(); err != nil {
+			// Check if the error is due to context cancellation
+			if ctx.Err() != nil {
+				ch <- StreamEvent{Type: "done"}
+				return
+			}
 			ch <- StreamEvent{Type: "error", Error: err}
 			return
 		}
@@ -323,7 +335,6 @@ func (c *Client) ListModels() ([]Model, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	result := make([]Model, len(models.Data))
 	for i, m := range models.Data {
 		result[i] = Model{

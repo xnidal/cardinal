@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -29,6 +30,7 @@ type Model struct {
 	thinking         string
 	pendingToolCalls []api.ToolCall
 	streamCh         <-chan api.StreamEvent
+	cancelFunc       context.CancelFunc
 	err              error
 	client           *api.Client
 	toolDefs         []api.Tool
@@ -83,13 +85,13 @@ func NewModel(cfg *config.Config) Model {
 	ta.ShowLineNumbers = false
 	ta.Prompt = ""
 	ta.CharLimit = 4000
-	// Remove background styling
+
 	ta.FocusedStyle.Base = lipgloss.NewStyle()
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 	ta.FocusedStyle.Placeholder = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	ta.FocusedStyle.Text = lipgloss.NewStyle()
 	ta.BlurredStyle = ta.FocusedStyle
-	// Disable newline insertion
+
 	ta.KeyMap.InsertNewline = key.NewBinding()
 
 	s := spinner.New()
@@ -351,7 +353,7 @@ func (m Model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.busy {
-			return m, nil
+			return m.cancelCurrentRequest()
 		}
 	}
 
@@ -359,6 +361,33 @@ func (m Model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	m.input, cmd = m.input.Update(msg)
 	m.syncSuggestions()
 	return m, cmd
+}
+
+func (m Model) cancelCurrentRequest() (tea.Model, tea.Cmd) {
+	if m.cancelFunc != nil {
+		m.cancelFunc()
+		m.cancelFunc = nil
+	}
+
+	streamingContent := strings.TrimSpace(m.streaming)
+	thinkingContent := strings.TrimSpace(m.thinking)
+
+	m.streamCh = nil
+	m.streaming = ""
+	m.thinking = ""
+	m.pendingToolCalls = nil
+	m.busy = false
+	m.retryCount = 0
+
+	if streamingContent != "" || thinkingContent != "" {
+		m.addAssistantMessageWithThinking(streamingContent, thinkingContent)
+		m.finalizeUIMessageHandling()
+	}
+
+	m.status = "Cancelled"
+	m.errorStatus = "Request cancelled"
+	m.errorStatusTime = time.Now()
+	return m, nil
 }
 
 func (m *Model) syncSuggestions() {
