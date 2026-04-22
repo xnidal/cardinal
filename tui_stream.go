@@ -118,6 +118,15 @@ func (m Model) buildMessages() []api.Message {
 	return messages
 }
 
+func (m Model) getMaxTokens(messages []api.Message) int {
+	contextLimit := m.contextLimit
+	if contextLimit == 0 {
+		contextLimit = 128000
+	}
+	maxTokens := min(api.CalculateMaxTokens(messages, m.toolDefs, contextLimit), 16384)
+	return maxTokens
+}
+
 func (m Model) estimateTokens(messages []api.Message) int {
 	total := 0
 	for _, msg := range messages {
@@ -218,7 +227,8 @@ func (m Model) getSystemPrompt() string {
 
 func (m Model) beginStream() (tea.Model, tea.Cmd) {
 	messages := m.buildMessages()
-	m.streamCh = m.client.ChatStreamChannel(m.cfg.Model, messages, m.toolDefs)
+	maxTokens := m.getMaxTokens(messages)
+	m.streamCh = m.client.ChatStreamChannel(m.cfg.Model, messages, m.toolDefs, maxTokens)
 	m.streaming = ""
 	m.thinking = ""
 	m.pendingToolCalls = nil
@@ -304,6 +314,8 @@ func (m Model) handleStreamEvent(event api.StreamEvent) (tea.Model, tea.Cmd) {
 		return m.finishAssistantTurn()
 
 	case "error":
+		logBadRequestError(event.Error, m.cfg.Model, m.buildMessages(), m.toolDefs)
+
 		if shouldRetry(event.Error, m.retryCount) {
 			m.retryCount++
 			errorMsg := fmt.Sprintf("Error: %s (retry %d/%d)", formatError(event.Error), m.retryCount, maxRetries)
@@ -334,7 +346,8 @@ func (m Model) handleRetry(msg streamRetryMsg) (tea.Model, tea.Cmd) {
 	}
 
 	messages := m.buildMessages()
-	m.streamCh = m.client.ChatStreamChannel(m.cfg.Model, messages, m.toolDefs)
+	maxTokens := m.getMaxTokens(messages)
+	m.streamCh = m.client.ChatStreamChannel(m.cfg.Model, messages, m.toolDefs, maxTokens)
 	m.streaming = ""
 	m.thinking = ""
 	m.pendingToolCalls = nil
@@ -429,12 +442,12 @@ func (m *Model) addAssistantMessageWithThinking(content, thinking string, toolCa
 	m.lastMessages = append([]api.Message(nil), m.messages...)
 }
 
-// addToolResult adds a tool result message to the history
-func (m *Model) addToolResult(name, content string, args ...string) {
+func (m *Model) addToolResult(name, content, toolCallID string, args ...string) {
 	msg := api.Message{
-		Role:    "tool",
-		Name:    name,
-		Content: content,
+		Role:       "tool",
+		Name:       name,
+		Content:    content,
+		ToolCallID: toolCallID,
 	}
 	if len(args) > 0 {
 		msg.ToolArgs = args[0]
@@ -463,7 +476,7 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 	if xmlToolCallPattern.MatchString(m.thinking) || xmlToolCallPattern.MatchString(m.streaming) {
 		// Store thinking separately, not duplicated in content
 		m.addAssistantMessageWithThinking(m.streaming, m.thinking)
-		m.addToolResult("format_error", "Error: Your message was ignored because it contained XML-formatted tool calls. You MUST use the proper function calling API with JSON format. Do NOT write tool calls as text in your message. The system will handle tool execution for you. Just respond normally and the tools will be called automatically through the API.")
+		m.addToolResult("format_error", "Error: Your message was ignored because it contained XML-formatted tool calls. You MUST use the proper function calling API with JSON format. Do NOT write tool calls as text in your message. The system will handle tool execution for you. Just respond normally and the tools will be called automatically through the API.", "")
 		m.finalizeUIMessageHandling()
 		return m.beginStream()
 	}
@@ -482,7 +495,7 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 		var needsApprovalIndices []int
 
 		for i, tc := range toolCalls {
-			if !tools.RequiresApproval(tc.Function.Name) {
+			if m.autoApprove || !tools.RequiresApproval(tc.Function.Name) {
 				autoApproved = append(autoApproved, tc)
 			} else {
 				needsApproval = append(needsApproval, tc)
@@ -505,7 +518,7 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 		if len(autoApproved) > 0 {
 			approvals := make([]bool, len(toolCalls))
 			for i := range toolCalls {
-				approvals[i] = !tools.RequiresApproval(toolCalls[i].Function.Name)
+				approvals[i] = m.autoApprove || !tools.RequiresApproval(toolCalls[i].Function.Name)
 			}
 			m.busy = true
 			m.setStatus("Running tools")
@@ -556,6 +569,7 @@ func (m Model) executeToolPlanCmd(assistantContent, thinkingContent string, tool
 		results := executeToolPlan(working, toolCallsCopy, approvalsCopy, onEditSoul)
 		return toolExecutionMsg{
 			assistantContent: assistantContent,
+			thinkingContent:  thinkingContent,
 			toolCalls:        toolCallsCopy,
 			results:          results,
 		}
@@ -569,11 +583,15 @@ func (m Model) handleToolExecution(msg toolExecutionMsg) (tea.Model, tea.Cmd) {
 	for i, result := range msg.results {
 		name := result.Name
 		var args string
-		if i < len(msg.toolCalls) && msg.toolCalls[i].Function.Name != "" {
-			name = msg.toolCalls[i].Function.Name
+		var toolCallID string
+		if i < len(msg.toolCalls) {
+			if msg.toolCalls[i].Function.Name != "" {
+				name = msg.toolCalls[i].Function.Name
+			}
 			args = msg.toolCalls[i].Function.Arguments
+			toolCallID = msg.toolCalls[i].ID
 		}
-		m.addToolResult(name, tools.FormatToolResult(result), args)
+		m.addToolResult(name, tools.FormatToolResult(result), toolCallID, args)
 	}
 
 	m.setStatus("Continuing after tool results")

@@ -89,11 +89,40 @@ func (c *Client) GetOpenAIClient() *openai.Client {
 	return &c.client
 }
 
-func (c *Client) ChatStreamChannel(model string, messages []Message, tools []Tool) <-chan StreamEvent {
-	return c.ChatStreamChannelCtx(context.Background(), model, messages, tools)
+func (c *Client) ChatStreamChannel(model string, messages []Message, tools []Tool, maxTokens int) <-chan StreamEvent {
+	return c.ChatStreamChannelCtx(context.Background(), model, messages, tools, maxTokens)
 }
 
-func (c *Client) ChatStreamChannelCtx(ctx context.Context, model string, messages []Message, tools []Tool) <-chan StreamEvent {
+func CalculateMaxTokens(messages []Message, tools []Tool, contextLimit int) int {
+	estimatedPrompt := EstimateTokens(messages, tools)
+	maxTokens := max(contextLimit-estimatedPrompt, 1)
+	return maxTokens
+}
+
+func EstimateTokens(messages []Message, tools []Tool) int {
+	total := 0
+	for _, msg := range messages {
+		total += len(msg.Content) / 4
+		total += len(msg.Role) / 4
+		if msg.Thinking != "" {
+			total += len(msg.Thinking) / 4
+			total += 5
+		}
+		for _, tc := range msg.ToolCalls {
+			total += len(tc.Function.Name) / 4
+			total += len(tc.Function.Arguments) / 4
+		}
+		total += 10
+	}
+	for _, tool := range tools {
+		total += len(tool.Function.Name) / 4
+		total += len(tool.Function.Description) / 4
+		total += 20
+	}
+	return total
+}
+
+func (c *Client) ChatStreamChannelCtx(ctx context.Context, model string, messages []Message, tools []Tool, maxTokens int) <-chan StreamEvent {
 	ch := make(chan StreamEvent, 100)
 
 	go func() {
@@ -120,10 +149,14 @@ func (c *Client) ChatStreamChannelCtx(ctx context.Context, model string, message
 			}
 		}
 
+		if maxTokens < 1 {
+			maxTokens = 4096
+		}
+
 		params := openai.ChatCompletionNewParams{
 			Messages:  chatMessages,
 			Model:     openai.ChatModel(model),
-			MaxTokens: openai.Int(4096),
+			MaxTokens: openai.Int(int64(maxTokens)),
 			StreamOptions: openai.ChatCompletionStreamOptionsParam{
 				IncludeUsage: openai.Bool(true),
 			},
@@ -250,7 +283,7 @@ func (c *Client) ChatStreamChannelCtx(ctx context.Context, model string, message
 	return ch
 }
 
-func (c *Client) Chat(model string, messages []Message, tools []Tool) (Message, Usage, error) {
+func (c *Client) Chat(model string, messages []Message, tools []Tool, maxTokens int) (Message, Usage, error) {
 	ctx := context.Background()
 
 	chatMessages := make([]openai.ChatCompletionMessageParamUnion, len(messages))
@@ -268,15 +301,20 @@ func (c *Client) Chat(model string, messages []Message, tools []Tool) (Message, 
 		case "system":
 			chatMessages[i] = openai.SystemMessage(msg.Content)
 		case "tool":
-			chatMessages[i] = openai.ToolMessage(msg.Name, msg.Content)
+			chatMessages[i] = openai.ToolMessage(msg.Content, msg.ToolCallID)
 		default:
 			chatMessages[i] = openai.UserMessage(msg.Content)
 		}
 	}
 
+	if maxTokens < 1 {
+		maxTokens = 4096
+	}
+
 	params := openai.ChatCompletionNewParams{
-		Messages: chatMessages,
-		Model:    openai.ChatModel(model),
+		Messages:  chatMessages,
+		Model:     openai.ChatModel(model),
+		MaxTokens: openai.Int(int64(maxTokens)),
 	}
 
 	if len(tools) > 0 {

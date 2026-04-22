@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"cardinal/pkg/api"
@@ -186,30 +187,14 @@ func (m Model) renderChatHistory(messages []api.Message, scrollOffset int, hasSt
 		Render(m.cfg.ActiveProfileName() + " > " + m.cfg.Model + " @ " + compactEndpoint(m.cfg.APIURL))
 	blocks = append(blocks, modelInfo, "")
 
-	if scrollOffset > 0 {
-		blocks = append(blocks,
-			lipgloss.NewStyle().
-				Foreground(dimColor).
-				Italic(true).
-				Render("↑ "+fmt.Sprintf("%d older message%s", scrollOffset, pluralize(scrollOffset))),
-		)
-	}
-
-	visible := messages
-	if scrollOffset > 0 && scrollOffset < len(messages) {
-		visible = messages[scrollOffset:]
-	}
-	for i, message := range visible {
+	for _, message := range messages {
 		if rendered := m.renderMessage(message); rendered != "" {
-			blocks = append(blocks, rendered)
-		}
-		if i < len(visible)-1 {
-			blocks = append(blocks, "")
+			blocks = append(blocks, "\n"+rendered)
 		}
 	}
 
 	if hasThinking || hasStreaming {
-		blocks = append(blocks, m.renderStreamingMessage())
+		blocks = append(blocks, "\n"+m.renderStreamingMessage())
 	}
 
 	if chatErr != nil {
@@ -225,6 +210,15 @@ func (m Model) renderChatHistory(messages []api.Message, scrollOffset int, hasSt
 }
 
 func (m Model) renderWelcome() string {
+	asciiArt := []string{
+		"_________                  .___.__              .__   ",
+		"\\_   ___ \\_____ _______  __| _/|__| ____ _____  |  |  ",
+		"/    \\  \\/\\__  \\_  __ \\/ __ | |  |/    \\__  \\ |  |  ",
+		"\\     \\____/ __ \\|  | \\/ /_/ | |  |   |  \\/ __ \\|  |__",
+		" \\______  (____  /__|  \\____ | |__|___|  (____  /____/",
+		"        \\/     \\/           \\/         \\/     \\/      ",
+	}
+
 	commands := []struct {
 		cmd  string
 		desc string
@@ -237,12 +231,22 @@ func (m Model) renderWelcome() string {
 
 	var lines []string
 
-	// Show model info at top
 	lines = append(lines,
 		lipgloss.NewStyle().
 			Foreground(dimColor).
 			Render(m.cfg.ActiveProfileName()+" > "+m.cfg.Model+" @ "+compactEndpoint(m.cfg.APIURL)),
 	)
+
+	lines = append(lines, "")
+
+	asciiStyle := lipgloss.NewStyle().
+		Foreground(accentColor).
+		Bold(true).
+		MarginLeft(2)
+
+	for _, line := range asciiArt {
+		lines = append(lines, asciiStyle.Render(line))
+	}
 
 	lines = append(lines, "")
 
@@ -322,9 +326,7 @@ func (m Model) renderMessage(msg api.Message) string {
 		blocks = append(blocks, contentBox)
 	}
 
-	return lipgloss.NewStyle().
-		MarginBottom(1).
-		Render(lipgloss.JoinVertical(lipgloss.Left, blocks...))
+	return lipgloss.JoinVertical(lipgloss.Left, blocks...)
 }
 
 func (m Model) renderToolResult(msg api.Message) string {
@@ -540,7 +542,19 @@ func (m Model) formatWriteFileOutput(content, toolArgs string, maxHeight, maxWid
 		path = extractPathFromToolResult(content)
 	}
 	displayPath := m.formatPath(path)
-	return lipgloss.NewStyle().Foreground(accentColor).Render("> write " + displayPath)
+	header := lipgloss.NewStyle().Foreground(accentColor).Render("> write " + displayPath)
+
+	trimmedContent := strings.TrimSpace(content)
+	if trimmedContent == "" || trimmedContent == "Success" {
+		return header
+	}
+	if strings.HasPrefix(trimmedContent, "Error:") {
+		return header + "\n" + lipgloss.NewStyle().Foreground(errorColor).Render(trimmedContent)
+	}
+	if len(trimmedContent) > maxWidth {
+		trimmedContent = trimmedContent[:maxWidth-3] + "..."
+	}
+	return header + "\n" + lipgloss.NewStyle().Foreground(dimColor).Render(" "+trimmedContent)
 }
 
 func (m Model) formatCalculateOutput(content, toolArgs string, maxHeight, maxWidth int) string {
@@ -604,7 +618,7 @@ func (m Model) formatEditFileOutput(content, toolArgs string, maxHeight, maxWidt
 	lines := strings.Split(content, "\n")
 	var diffLines []string
 	for _, line := range lines {
-		if strings.HasPrefix(line, "-") || strings.HasPrefix(line, "+") {
+		if strings.HasPrefix(line, "-") || strings.HasPrefix(line, "+") || strings.HasPrefix(line, " ") {
 			diffLines = append(diffLines, line)
 		}
 	}
@@ -623,9 +637,13 @@ func (m Model) formatEditFileOutput(content, toolArgs string, maxHeight, maxWidt
 				coloredDiff = append(coloredDiff,
 					lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Render(" "+line),
 				)
-			} else {
+			} else if strings.HasPrefix(line, "+") {
 				coloredDiff = append(coloredDiff,
 					lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render(" "+line),
+				)
+			} else {
+				coloredDiff = append(coloredDiff,
+					lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(" "+line),
 				)
 			}
 		}
@@ -687,8 +705,10 @@ func (m Model) formatGrepOutput(content, toolArgs string, maxHeight, maxWidth in
 	if len(parts) > 0 {
 		headerText += " " + strings.Join(parts, " ")
 	}
-	if matchCount > 0 {
-		headerText += fmt.Sprintf(" (%d match%s)", matchCount, pluralize(matchCount))
+	if matchCount == 1 {
+		headerText += " (1 match)"
+	} else if matchCount > 0 {
+		headerText += " (" + strconv.Itoa(matchCount) + " matches)"
 	} else if content == "No matches found" {
 		headerText += " (no matches)"
 	}
@@ -1256,7 +1276,7 @@ func (m Model) renderFooter() string {
 		}
 	}
 
-	hint := fmt.Sprintf(" Ctrl+C quit%s%s • Tab complete • /help", scrollHint, contextHint)
+	hint := fmt.Sprintf(" Ctrl+C quit%s%s • %s • /help", scrollHint, contextHint, m.working)
 	return "\n" + dimStyle.Render(hint)
 }
 

@@ -22,6 +22,22 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+var customSpinner = spinner.Spinner{
+	Frames: []string{
+		"⠋", // dots 1,2,3,5,6 - missing 4,7,8
+		"⠙", // dots 1,2,3,5,7 - missing 4,6,8
+		"⠹", // dots 1,2,3,5,8 - missing 4,6,7
+		"⠸", // dots 1,2,3,6,8 - missing 4,5,7
+		"⠼", // dots 1,2,4,5,6 - missing 3,7,8
+		"⠴", // dots 1,2,4,5,7 - missing 3,6,8
+		"⠦", // dots 1,2,4,5,8 - missing 3,6,7
+		"⠧", // dots 1,2,4,6,7 - missing 3,5,8
+		"⠇", // dots 1,2,4,6,8 - missing 3,5,7
+		"⠏", // dots 1,2,4,7,8 - missing 3,5,6
+	},
+	FPS: 80,
+}
+
 type Model struct {
 	input            textarea.Model
 	spinner          spinner.Model
@@ -95,7 +111,7 @@ func NewModel(cfg *config.Config) Model {
 	ta.KeyMap.InsertNewline = key.NewBinding()
 
 	s := spinner.New()
-	s.Spinner = spinner.Dot
+	s.Spinner = customSpinner
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
 
 	working, _ := os.Getwd()
@@ -469,5 +485,5 @@ func (m *Model) updateViewportContent() {
 }
 
 func (m *Model) renderConversationContent() string {
-	return m.renderChatHistory(m.messages, m.viewport.YOffset, strings.TrimSpace(m.streaming) != "", strings.TrimSpace(m.thinking) != "", m.err)
+	return m.renderChatHistory(m.messages, 0, strings.TrimSpace(m.streaming) != "", strings.TrimSpace(m.thinking) != "", m.err)
 }

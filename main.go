@@ -47,6 +47,12 @@ func main() {
 			runInstall()
 		case "run":
 			runCLI(cfg, strings.Join(args[1:], " "))
+		case "originchats":
+			serverURL := ""
+			if len(args) > 1 {
+				serverURL = args[1]
+			}
+			runOriginChats(cfg, serverURL)
 		}
 		return
 	}
@@ -116,7 +122,11 @@ func runCLI(cfg *config.Config, prompt string) {
 	for {
 		messages = compressMessagesCLI(messages)
 
-		ch := client.ChatStreamChannel(cfg.Model, messages, toolDefs)
+		maxTokens := api.CalculateMaxTokens(messages, toolDefs, 128000)
+		if maxTokens > 16384 {
+			maxTokens = 16384
+		}
+		ch := client.ChatStreamChannel(cfg.Model, messages, toolDefs, maxTokens)
 
 		var fullContent string
 		var toolCalls []api.ToolCall
@@ -139,6 +149,8 @@ func runCLI(cfg *config.Config, prompt string) {
 		}
 
 		if streamErr != nil {
+			logBadRequestError(streamErr, cfg.Model, messages, toolDefs)
+
 			if shouldRetryCLI(streamErr, retryCount, maxRetries) {
 				retryCount++
 				delay := min(time.Duration(float64(baseDelay)*math.Pow(2, float64(retryCount-1))), 30*time.Second)

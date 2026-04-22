@@ -1019,30 +1019,48 @@ func formatDiff(oldContent, newContent string) string {
 	oldLines := strings.Split(oldContent, "\n")
 	newLines := strings.Split(newContent, "\n")
 
-	var diff []string
-
-	for i := 0; i < len(oldLines) || i < len(newLines); i++ {
-		oldLine := ""
-		newLine := ""
-		if i < len(oldLines) {
-			oldLine = oldLines[i]
-		}
-		if i < len(newLines) {
-			newLine = newLines[i]
-		}
-
-		if oldLine != newLine {
-			if oldLine != "" {
-				diff = append(diff, fmt.Sprintf("-%d: %s", i+1, oldLine))
-			}
-			if newLine != "" {
-				diff = append(diff, fmt.Sprintf("+%d: %s", i+1, newLine))
-			}
-		}
+	start := 0
+	for start < len(oldLines) && start < len(newLines) && oldLines[start] == newLines[start] {
+		start++
 	}
 
-	if len(diff) == 0 {
+	oldEnd := len(oldLines) - 1
+	newEnd := len(newLines) - 1
+	for oldEnd >= start && newEnd >= start && oldLines[oldEnd] == newLines[newEnd] {
+		oldEnd--
+		newEnd--
+	}
+
+	if start > oldEnd && start > newEnd {
 		return "No changes"
+	}
+
+	contextLines := 2
+	ctxStart := start - contextLines
+	if ctxStart < 0 {
+		ctxStart = 0
+	}
+	ctxOldEnd := oldEnd + contextLines
+	if ctxOldEnd >= len(oldLines) {
+		ctxOldEnd = len(oldLines) - 1
+	}
+	ctxNewEnd := newEnd + contextLines
+	if ctxNewEnd >= len(newLines) {
+		ctxNewEnd = len(newLines) - 1
+	}
+
+	var diff []string
+	for i := ctxStart; i < start; i++ {
+		diff = append(diff, fmt.Sprintf(" %d: %s", i+1, oldLines[i]))
+	}
+	for i := start; i <= oldEnd; i++ {
+		diff = append(diff, fmt.Sprintf("-%d: %s", i+1, oldLines[i]))
+	}
+	for i := start; i <= newEnd; i++ {
+		diff = append(diff, fmt.Sprintf("+%d: %s", i+1, newLines[i]))
+	}
+	for i := oldEnd + 1; i <= ctxOldEnd; i++ {
+		diff = append(diff, fmt.Sprintf(" %d: %s", i+1, oldLines[i]))
 	}
 
 	return strings.Join(diff, "\n")
@@ -1093,17 +1111,16 @@ func (th *ToolHandler) resolvePath(path string) (string, error) {
 }
 
 func FormatToolResult(result ToolResult) string {
-	var output strings.Builder
 	if !result.Success {
-		output.WriteString(fmt.Sprintf("[%s] Error: ", result.Name))
+		if result.Error != "" {
+			return fmt.Sprintf("Error: %s", result.Error)
+		}
+		return "Error: unknown error"
 	}
 	if result.Output != "" {
-		output.WriteString(result.Output)
+		return result.Output
 	}
-	if result.Error != "" {
-		output.WriteString(result.Error)
-	}
-	return output.String()
+	return "Success"
 }
 
 func FormatToolResultCLI(result ToolResult, toolName, args string) string {
