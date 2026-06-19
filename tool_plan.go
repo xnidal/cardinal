@@ -15,18 +15,36 @@ func defaultToolApprovals(toolCalls []api.ToolCall) []bool {
 
 func executeToolPlan(working string, toolCalls []api.ToolCall, approvals []bool, onEditSoul func()) []tools.ToolResult {
 	handler := tools.NewToolHandler(working, onEditSoul)
-	results := make([]tools.ToolResult, 0, len(toolCalls))
 
+	// Filter to only approved calls, but maintain indices for results
+	approvedCalls := make([]tools.ToolCall, 0, len(toolCalls))
+	approvedIndices := make([]int, 0, len(toolCalls))
 	for i, toolCall := range toolCalls {
 		approved := i < len(approvals) && approvals[i]
-		if !approved {
-			results = append(results, tools.PermissionDeniedResult(toolCall.Function.Name))
-			continue
+		if approved {
+			approvedCalls = append(approvedCalls, tools.ToolCall{
+				Name: toolCall.Function.Name,
+				Args: toolCall.Function.Arguments,
+			})
+			approvedIndices = append(approvedIndices, i)
 		}
-		results = append(results, handler.Execute(tools.ToolCall{
-			Name: toolCall.Function.Name,
-			Args: toolCall.Function.Arguments,
-		}))
+	}
+
+	// Execute approved calls in parallel
+	approvedResults := handler.ExecuteParallel(approvedCalls)
+
+	// Build full results array, inserting permission denied for unapproved calls
+	results := make([]tools.ToolResult, len(toolCalls))
+	for i := range toolCalls {
+		approved := i < len(approvals) && approvals[i]
+		if !approved {
+			results[i] = tools.PermissionDeniedResult(toolCalls[i].Function.Name)
+		}
+	}
+
+	// Fill in results for approved calls
+	for j, origIdx := range approvedIndices {
+		results[origIdx] = approvedResults[j]
 	}
 
 	return results

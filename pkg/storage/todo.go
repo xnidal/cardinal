@@ -23,15 +23,24 @@ const (
 	PriorityHigh   TodoPriority = "high"
 )
 
+// Step represents a discrete subtask within a todo item.
+type Step struct {
+	ID      string `json:"id"`
+	Title   string `json:"title"`
+	Done    bool   `json:"done"`
+}
+
 type TodoItem struct {
-	ID          string       `json:"id"`
-	Title       string       `json:"title"`
-	Description string       `json:"description,omitempty"`
-	Status      TodoStatus   `json:"status"`
+	ID          string      `json:"id"`
+	Title       string      `json:"title"`
+	Description string      `json:"description,omitempty"`
+	Status      TodoStatus  `json:"status"`
 	Priority    TodoPriority `json:"priority"`
-	DueDate     *time.Time   `json:"due_date,omitempty"`
-	CreatedAt   time.Time    `json:"created_at"`
-	UpdatedAt   time.Time    `json:"updated_at"`
+	DueDate     *time.Time  `json:"due_date,omitempty"`
+	Progress    int         `json:"progress,omitempty"`
+	Steps       []Step      `json:"steps,omitempty"`
+	CreatedAt   time.Time   `json:"created_at"`
+	UpdatedAt   time.Time   `json:"updated_at"`
 }
 
 type TodoList struct {
@@ -63,7 +72,7 @@ func SaveTodos(list *TodoList) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(list, "", "  ")
+	data, err := json.MarshalIndent(list, "", " ")
 	if err != nil {
 		return err
 	}
@@ -114,6 +123,73 @@ func UpdateTodo(id string, status *TodoStatus, priority *TodoPriority, dueDate *
 				return nil, err
 			}
 			return &list.Items[i], nil
+		}
+	}
+	return nil, os.ErrNotExist
+}
+
+// SetTodoProgress updates the progress percentage (0-100) of a todo item.
+func SetTodoProgress(id string, progress int) (*TodoItem, error) {
+	list, err := LoadTodos()
+	if err != nil {
+		return nil, err
+	}
+	for i := range list.Items {
+		if list.Items[i].ID == id {
+			if progress < 0 {
+				progress = 0
+			}
+			if progress > 100 {
+				progress = 100
+			}
+			list.Items[i].Progress = progress
+			list.Items[i].UpdatedAt = time.Now()
+			if err := SaveTodos(list); err != nil {
+				return nil, err
+			}
+			return &list.Items[i], nil
+		}
+	}
+	return nil, os.ErrNotExist
+}
+
+// SetTodoSteps replaces the steps/subtasks of a todo item.
+func SetTodoSteps(id string, steps []Step) (*TodoItem, error) {
+	list, err := LoadTodos()
+	if err != nil {
+		return nil, err
+	}
+	for i := range list.Items {
+		if list.Items[i].ID == id {
+			list.Items[i].Steps = steps
+			list.Items[i].UpdatedAt = time.Now()
+			if err := SaveTodos(list); err != nil {
+				return nil, err
+			}
+			return &list.Items[i], nil
+		}
+	}
+	return nil, os.ErrNotExist
+}
+
+// ToggleStep flips the done state of a step within a todo item.
+func ToggleStep(todoID, stepID string) (*TodoItem, error) {
+	list, err := LoadTodos()
+	if err != nil {
+		return nil, err
+	}
+	for i := range list.Items {
+		if list.Items[i].ID == todoID {
+			for j := range list.Items[i].Steps {
+				if list.Items[i].Steps[j].ID == stepID {
+					list.Items[i].Steps[j].Done = !list.Items[i].Steps[j].Done
+					list.Items[i].UpdatedAt = time.Now()
+					if err := SaveTodos(list); err != nil {
+						return nil, err
+					}
+					return &list.Items[i], nil
+				}
+			}
 		}
 	}
 	return nil, os.ErrNotExist

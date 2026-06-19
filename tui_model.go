@@ -73,8 +73,9 @@ type Model struct {
 	lastStatus       string
 	contextUsed      int
 	contextLimit     int
-	errorStatus      string
-	errorStatusTime  time.Time
+	errorStatus string
+	errorStatusTime time.Time
+	expandedThinking map[int]bool
 }
 
 var slashCommands = []string{
@@ -120,17 +121,18 @@ func NewModel(cfg *config.Config) Model {
 	vp.SetContent("")
 
 	return Model{
-		input:        ta,
-		spinner:      s,
-		client:       api.NewClient(cfg.APIURL, cfg.APIKey),
-		toolDefs:     convertToolDefs(tools.GetToolDefinitions()),
-		working:      working,
-		cfg:          cfg,
-		status:       "Ready",
-		soul:         loadSoul(),
-		viewport:     vp,
-		autoApprove:  false,
-		contextLimit: 128000,
+		input:            ta,
+		spinner:          s,
+		client:           api.NewClient(cfg.APIURL, cfg.APIKey),
+		toolDefs:         convertToolDefs(tools.GetToolDefinitions()),
+		working:          working,
+		cfg:              cfg,
+		status:           "Ready",
+		soul:             loadSoul(),
+		viewport:         vp,
+		autoApprove:      false,
+		contextLimit:     128000,
+		expandedThinking: make(map[int]bool),
 	}
 }
 
@@ -371,6 +373,19 @@ func (m Model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.busy {
 			return m.cancelCurrentRequest()
 		}
+
+	case tea.KeyCtrlO:
+		// Toggle thinking content visibility for the most recent message with thinking
+		for i := len(m.messages) - 1; i >= 0; i-- {
+			if strings.TrimSpace(m.messages[i].Thinking) != "" {
+				m.expandedThinking[i] = !m.expandedThinking[i]
+				if m.useViewport {
+					m.updateViewportContent()
+				}
+				return m, nil
+			}
+		}
+		return m, nil
 	}
 
 	var cmd tea.Cmd

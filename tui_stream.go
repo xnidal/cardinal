@@ -2,12 +2,13 @@ package main
 
 import (
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 
 	"cardinal/pkg/api"
 	"cardinal/pkg/tools"
+	"cardinal/pkg/parser"
+	"cardinal/pkg/prompt"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -218,11 +219,11 @@ func (m Model) doCompress(messages []api.Message) []api.Message {
 }
 
 func (m Model) getSystemPrompt() string {
-	systemPrompt := strings.TrimSpace(m.cfg.SystemPrompt)
-	if systemPrompt == "" {
-		systemPrompt = "You are Cardinal, a helpful coding assistant. Be concise and direct."
+	builder := prompt.NewPromptBuilder(m.working, m.soul)
+	if strings.TrimSpace(m.cfg.SystemPrompt) != "" {
+		builder.SetSectionContent("identity", m.cfg.SystemPrompt)
 	}
-	return systemPrompt + "\n\nWorking directory: " + m.working + "\n\nWhen using tools, you MUST use the standard function calling format with JSON arguments. Do NOT use XML tags like <tool_call>. Use the provided tool definitions through the proper API function calling mechanism."
+	return builder.Build()
 }
 
 func (m Model) beginStream() (tea.Model, tea.Cmd) {
@@ -287,10 +288,19 @@ func (m Model) handleStreamEvent(event api.StreamEvent) (tea.Model, tea.Cmd) {
 		return m, waitForStreamEvent(m.streamCh)
 
 	case "tool_call_writing":
+		toolCount := len(m.pendingToolCalls) + 1 // +1 for the one being written now
 		if event.ToolCallName != "" && event.ToolCallArgsLen > 0 {
-			m.setStatus(fmt.Sprintf("Writing tool call [%s] (%d characters)", event.ToolCallName, event.ToolCallArgsLen))
+			if toolCount > 1 {
+				m.setStatus(fmt.Sprintf("Writing tool call %d [%s] (%d chars)", toolCount, event.ToolCallName, event.ToolCallArgsLen))
+			} else {
+				m.setStatus(fmt.Sprintf("Writing tool call [%s] (%d characters)", event.ToolCallName, event.ToolCallArgsLen))
+			}
 		} else if event.ToolCallName != "" {
-			m.setStatus(fmt.Sprintf("Writing tool call [%s]", event.ToolCallName))
+			if toolCount > 1 {
+				m.setStatus(fmt.Sprintf("Writing tool call %d [%s]", toolCount, event.ToolCallName))
+			} else {
+				m.setStatus(fmt.Sprintf("Writing tool call [%s]", event.ToolCallName))
+			}
 		} else {
 			m.setStatus("Writing tool call...")
 		}
@@ -299,7 +309,12 @@ func (m Model) handleStreamEvent(event api.StreamEvent) (tea.Model, tea.Cmd) {
 	case "tool_call":
 		if event.Tool != nil {
 			m.pendingToolCalls = append(m.pendingToolCalls, *event.Tool)
-			m.setStatus("Review tool permissions")
+			toolCount := len(m.pendingToolCalls)
+			if toolCount > 1 {
+				m.setStatus(fmt.Sprintf("Review permissions (%d tool calls)", toolCount))
+			} else {
+				m.setStatus("Review tool permissions")
+			}
 		}
 		return m, waitForStreamEvent(m.streamCh)
 
@@ -471,9 +486,7 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 	m.streamCh = nil
 
 	// Check for XML-formatted tool calls in content
-	xmlToolCallPattern := regexp.MustCompile(`(<[a-z_]+\\s|<tool_call[^>]*name\\s*=\\s*["\'][^"\']+["\'][^>]*>)`)
-	// Check both thinking and streaming for XML patterns
-	if xmlToolCallPattern.MatchString(m.thinking) || xmlToolCallPattern.MatchString(m.streaming) {
+	if parser.ContainsToolCalls(m.thinking) || parser.ContainsToolCalls(m.streaming) {
 		// Store thinking separately, not duplicated in content
 		m.addAssistantMessageWithThinking(m.streaming, m.thinking)
 		m.addToolResult("format_error", "Error: Your message was ignored because it contained XML-formatted tool calls. You MUST use the proper function calling API with JSON format. Do NOT write tool calls as text in your message. The system will handle tool execution for you. Just respond normally and the tools will be called automatically through the API.", "")
@@ -510,7 +523,12 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 				approvals[i] = true
 			}
 			m.busy = true
-			m.setStatus("Running tools")
+			toolCount := len(toolCalls)
+			if toolCount > 1 {
+				m.setStatus(fmt.Sprintf("Running %d tools in parallel", toolCount))
+			} else {
+				m.setStatus("Running tool")
+			}
 			return m, m.executeToolPlanCmd(streamingContent, thinkingContent, toolCalls, approvals)
 		}
 
@@ -520,9 +538,14 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 			for i := range toolCalls {
 				approvals[i] = m.autoApprove || !tools.RequiresApproval(toolCalls[i].Function.Name)
 			}
-			m.busy = true
-			m.setStatus("Running tools")
-			return m, m.executeToolPlanCmd(streamingContent, thinkingContent, toolCalls, approvals)
+		m.busy = true
+		toolCount := approvedToolCount(approvals)
+		if toolCount > 1 {
+			m.setStatus(fmt.Sprintf("Running %d tools in parallel", toolCount))
+		} else {
+			m.setStatus("Running tool")
+		}
+		return m, m.executeToolPlanCmd(streamingContent, thinkingContent, toolCalls, approvals)
 		}
 
 		// All tools need approval

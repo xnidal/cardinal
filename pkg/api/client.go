@@ -153,14 +153,15 @@ func (c *Client) ChatStreamChannelCtx(ctx context.Context, model string, message
 			maxTokens = 4096
 		}
 
-		params := openai.ChatCompletionNewParams{
-			Messages:  chatMessages,
-			Model:     openai.ChatModel(model),
-			MaxTokens: openai.Int(int64(maxTokens)),
-			StreamOptions: openai.ChatCompletionStreamOptionsParam{
-				IncludeUsage: openai.Bool(true),
-			},
-		}
+	params := openai.ChatCompletionNewParams{
+		Messages: chatMessages,
+		Model:    openai.ChatModel(model),
+		MaxTokens: openai.Int(int64(maxTokens)),
+		StreamOptions: openai.ChatCompletionStreamOptionsParam{
+			IncludeUsage: openai.Bool(true),
+		},
+		ParallelToolCalls: openai.Bool(true),
+	}
 
 		if len(tools) > 0 {
 			chatTools := make([]openai.ChatCompletionToolUnionParam, len(tools))

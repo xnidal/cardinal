@@ -187,8 +187,8 @@ func (m Model) renderChatHistory(messages []api.Message, scrollOffset int, hasSt
 		Render(m.cfg.ActiveProfileName() + " > " + m.cfg.Model + " @ " + compactEndpoint(m.cfg.APIURL))
 	blocks = append(blocks, modelInfo, "")
 
-	for _, message := range messages {
-		if rendered := m.renderMessage(message); rendered != "" {
+	for i, message := range messages {
+		if rendered := m.renderMessage(i, message); rendered != "" {
 			blocks = append(blocks, "\n"+rendered)
 		}
 	}
@@ -271,7 +271,7 @@ func (m Model) renderWelcome() string {
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 
-func (m Model) renderMessage(msg api.Message) string {
+func (m Model) renderMessage(msgIndex int, msg api.Message) string {
 	if msg.Role == "system" {
 		return ""
 	}
@@ -294,33 +294,69 @@ func (m Model) renderMessage(msg api.Message) string {
 
 	// Render thinking section if present
 	if thinking != "" {
+		expanded := m.expandedThinking[msgIndex]
+		var arrow string
+		if expanded {
+			arrow = "▾"
+		} else {
+			arrow = "▸"
+		}
 		thinkingLabel := lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("8")).
-			Render(icon + " " + label + " [thinking]")
+			MaxWidth(m.width).
+			Render(icon + " " + label + " [thinking] " + arrow)
 
+		if expanded {
 		thinkingBox := lipgloss.NewStyle().
 			PaddingLeft(3).
 			Width(max(m.width-4, 20)).
+			MaxWidth(m.width).
 			Italic(true).
 			Foreground(lipgloss.Color("8")).
 			Render(thinking)
-
 		blocks = append(blocks, thinkingLabel)
 		blocks = append(blocks, thinkingBox)
+	} else {
+		// Collapsed: show a preview that fits on one line
+		// Calculate available width: total width minus the label prefix and (ctrl+o) suffix
+		prefixText := icon + " " + label + " [thinking] " + arrow + " "
+		suffixText := " (ctrl+o)"
+		labelWidth := len(prefixText) // label uses basic ASCII chars + arrow
+		suffixWidth := len(suffixText)
+		previewMaxWidth := max(m.width-labelWidth-suffixWidth-2, 20) // -2 for safety margin
+
+		preview := thinking
+		firstNewline := strings.Index(thinking, "\n")
+		if firstNewline > 0 && firstNewline < previewMaxWidth {
+			preview = thinking[:firstNewline]
+		} else if len(preview) > previewMaxWidth {
+			preview = preview[:max(previewMaxWidth-3, 0)] + "..."
+		}
+
+		collapsedLine := prefixText + preview + suffixText
+		collapsedLabel := lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("8")).
+			MaxWidth(m.width).
+			Render(collapsedLine)
+		blocks = append(blocks, collapsedLabel)
+	}
 	}
 
 	// Render content section if present
 	if content != "" {
-		contentLabel := lipgloss.NewStyle().
-			Bold(true).
-			Foreground(color).
-			Render(icon + " " + label)
+	contentLabel := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(color).
+		MaxWidth(m.width).
+		Render(icon + " " + label)
 
-		contentBox := lipgloss.NewStyle().
-			PaddingLeft(3).
-			Width(max(m.width-4, 20)).
-			Render(content)
+	contentBox := lipgloss.NewStyle().
+		PaddingLeft(3).
+		Width(max(m.width-4, 20)).
+		MaxWidth(m.width).
+		Render(content)
 
 		blocks = append(blocks, contentLabel)
 		blocks = append(blocks, contentBox)
@@ -458,6 +494,7 @@ func (m Model) renderToolResult(msg api.Message) string {
 
 	return lipgloss.NewStyle().
 		PaddingLeft(2).
+		MaxWidth(m.width).
 		Render(content)
 }
 
@@ -1053,14 +1090,14 @@ func (m Model) renderStreamingMessage() string {
 
 	// Render thinking section if present
 	if thinking != "" {
-		blocks = append(blocks, lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("8")).Render("> Cardinal [thinking]"))
-		blocks = append(blocks, lipgloss.NewStyle().PaddingLeft(4).Width(max(m.width-4, 20)).Italic(true).Foreground(lipgloss.Color("8")).Render(thinking))
+		blocks = append(blocks, lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("8")).MaxWidth(m.width).Render("> Cardinal [thinking]"))
+		blocks = append(blocks, lipgloss.NewStyle().PaddingLeft(4).Width(max(m.width-4, 20)).MaxWidth(m.width).Italic(true).Foreground(lipgloss.Color("8")).Render(thinking))
 	}
 
 	// Render streaming section if present
 	if streaming != "" {
-		blocks = append(blocks, lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("5")).Render("> Cardinal"))
-		blocks = append(blocks, lipgloss.NewStyle().PaddingLeft(4).Width(max(m.width-4, 20)).Render(streaming))
+		blocks = append(blocks, lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("5")).MaxWidth(m.width).Render("> Cardinal"))
+		blocks = append(blocks, lipgloss.NewStyle().PaddingLeft(4).Width(max(m.width-4, 20)).MaxWidth(m.width).Render(streaming))
 	}
 
 	if len(blocks) == 0 {
@@ -1266,6 +1303,20 @@ func (m Model) renderFooter() string {
 		scrollHint = " • ↑/↓ scroll"
 	}
 
+	// Check if there are any messages with thinking content
+	hasThinking := false
+	for _, msg := range m.messages {
+		if strings.TrimSpace(msg.Thinking) != "" {
+			hasThinking = true
+			break
+		}
+	}
+
+	thinkingHint := ""
+	if hasThinking {
+		thinkingHint = " • ctrl+o toggle thinking"
+	}
+
 	var contextHint string
 	if m.contextUsed > 0 && m.contextLimit > 0 {
 		percent := float64(m.contextUsed) / float64(m.contextLimit) * 100
@@ -1276,7 +1327,7 @@ func (m Model) renderFooter() string {
 		}
 	}
 
-	hint := fmt.Sprintf(" Ctrl+C quit%s%s • %s • /help", scrollHint, contextHint, m.working)
+	hint := fmt.Sprintf(" Ctrl+C quit%s%s%s • %s • /help", scrollHint, thinkingHint, contextHint, m.working)
 	return "\n" + dimStyle.Render(hint)
 }
 

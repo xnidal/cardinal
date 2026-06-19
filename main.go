@@ -8,13 +8,13 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"cardinal/pkg/api"
+	"cardinal/pkg/parser"
+	promptpkg "cardinal/pkg/prompt"
 	"cardinal/pkg/config"
 	"cardinal/pkg/tools"
 )
@@ -47,12 +47,7 @@ func main() {
 			runInstall()
 		case "run":
 			runCLI(cfg, strings.Join(args[1:], " "))
-		case "originchats":
-			serverURL := ""
-			if len(args) > 1 {
-				serverURL = args[1]
-			}
-			runOriginChats(cfg, serverURL)
+	
 		}
 		return
 	}
@@ -100,8 +95,11 @@ func runInstall() {
 
 func runCLI(cfg *config.Config, prompt string) {
 	working, _ := os.Getwd()
-	systemPrompt := cfg.SystemPrompt + "\n\nWorking directory: " + working
-	systemPrompt += "\n\nWhen using tools, you MUST use the standard function calling format with JSON arguments. Do NOT use XML tags like <tool_call>. Use the provided tool definitions through the proper API function calling mechanism."
+	builder := promptpkg.NewPromptBuilder(working, "")
+	if cfg.SystemPrompt != "" && cfg.SystemPrompt != "You are Cardinal, a helpful coding assistant. Be concise and direct." {
+		builder.SetSectionContent("identity", cfg.SystemPrompt)
+	}
+	systemPrompt := builder.Build()
 
 	messages := []api.Message{
 		{Role: "system", Content: systemPrompt},
@@ -165,8 +163,7 @@ func runCLI(cfg *config.Config, prompt string) {
 		retryCount = 0
 
 		// Check for XML-formatted tool calls in content
-		xmlToolCallPattern := regexp.MustCompile(`(<tool_call>[a-z_]+\s|<tool_call[^>]*name\s*=\s*["'][^"']+["'][^>]*>)`)
-		if xmlToolCallPattern.MatchString(fullContent) {
+	if parser.ContainsToolCalls(fullContent) {
 			messages = append(messages, api.Message{
 				Role:    "assistant",
 				Content: fullContent,

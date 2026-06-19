@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"cardinal/pkg/storage"
 )
@@ -57,6 +58,8 @@ func NewToolHandler(workingDir string, onEditSoul func()) *ToolHandler {
 	th.tools["todo_list"] = th.executeTodoList
 	th.tools["todo_update"] = th.executeTodoUpdate
 	th.tools["todo_remove"] = th.executeTodoRemove
+	th.tools["todo_set_progress"] = th.executeTodoSetProgress
+	th.tools["todo_toggle_step"] = th.executeTodoToggleStep
 	th.tools["subagent"] = th.executeSubAgent
 	th.tools["subagent_status"] = th.executeSubAgentStatus
 	th.tools["subagent_list"] = th.executeSubAgentList
@@ -66,6 +69,10 @@ func NewToolHandler(workingDir string, onEditSoul func()) *ToolHandler {
 }
 
 func (th *ToolHandler) Execute(call ToolCall) ToolResult {
+	// Validate reason if required by policy
+	if result := ValidateReason(call.Name, call.Args, DefaultReasonPolicy()); result != nil {
+		return *result
+	}
 	executor, exists := th.tools[call.Name]
 	if !exists {
 		return ToolResult{Name: call.Name, Success: false, Error: fmt.Sprintf("unknown tool: %s", call.Name)}
@@ -75,7 +82,7 @@ func (th *ToolHandler) Execute(call ToolCall) ToolResult {
 
 func RequiresApproval(name string) bool {
 	switch name {
-	case "list_files", "read_file", "grep", "glob", "file_info", "edit_soul", "calculate", "todo_list", "subagent", "subagent_status", "subagent_list", "subagent_clear":
+	case "list_files", "read_file", "grep", "glob", "file_info", "edit_soul", "calculate", "todo_list", "todo_set_progress", "todo_toggle_step", "subagent", "subagent_status", "subagent_list", "subagent_clear":
 		return false
 	default:
 		return true
@@ -200,7 +207,11 @@ func SummarizeCall(name, args string) string {
 			return "edit_soul: replace '" + find + "'"
 		}
 	}
-	return truncate(name+" "+args, 60)
+	baseSummary := truncate(name+" "+args, 60)
+	if reason := ExtractReason(args); reason != "" {
+		return truncate(baseSummary+" [reason: "+reason+"]", 100)
+	}
+	return baseSummary
 }
 
 func (th *ToolHandler) executeBash(args string) ToolResult {
@@ -1269,8 +1280,9 @@ func GetToolDefinitions() []any {
 					"type": "object",
 					"properties": map[string]any{
 						"command": map[string]any{"type": "string", "description": "The bash command to execute"},
+				"reason":   map[string]any{"type": "string", "description": "Required: Explain why you are using this tool"},
 					},
-					"required": []string{"command"},
+					"required": []string{"command", "reason"},
 				},
 			},
 		},
@@ -1314,7 +1326,7 @@ func GetToolDefinitions() []any {
 						"path":    map[string]any{"type": "string", "description": "The file path"},
 						"content": map[string]any{"type": "string", "description": "The content to write"},
 					},
-					"required": []string{"path", "content"},
+					"required": []string{"path", "content", "reason"},
 				},
 			},
 		},
@@ -1330,7 +1342,7 @@ func GetToolDefinitions() []any {
 						"find":    map[string]any{"type": "string", "description": "Text to find"},
 						"replace": map[string]any{"type": "string", "description": "Text to replace it with"},
 					},
-					"required": []string{"path", "find", "replace"},
+					"required": []string{"path", "find", "replace", "reason"},
 				},
 			},
 		},
@@ -1404,7 +1416,7 @@ func GetToolDefinitions() []any {
 						"find":    map[string]any{"type": "string", "description": "Text to find in SOUL.md"},
 						"replace": map[string]any{"type": "string", "description": "Text to replace it with"},
 					},
-					"required": []string{"find", "replace"},
+					"required": []string{"find", "replace", "reason"},
 				},
 			},
 		},
@@ -1473,4 +1485,166 @@ func truncate(value string, limit int) string {
 		return value[:limit]
 	}
 	return value[:limit-3] + "..."
+}
+
+
+// ExecuteParallel runs multiple tool calls concurrently when they are independent.
+// It detects dependencies between calls (e.g., one call depends on the output of
+// a previous call) and runs dependent calls sequentially while independent ones
+// run in parallel. Independent calls are those that don't write to the same file
+// or depend on a previous call's output path.
+func (th *ToolHandler) ExecuteParallel(calls []ToolCall) []ToolResult {
+	results := make([]ToolResult, len(calls))
+
+	// Group calls into batches of independent operations
+	batches := th.groupIndependentCalls(calls)
+
+	for _, batch := range batches {
+		if len(batch) == 1 {
+			// Single call - just execute it
+			i := batch[0]
+			results[i] = th.Execute(calls[i])
+		} else {
+			// Multiple independent calls - execute in parallel
+			var wg sync.WaitGroup
+			for _, idx := range batch {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					results[i] = th.Execute(calls[i])
+				}(idx)
+			}
+			wg.Wait()
+		}
+	}
+
+	return results
+}
+
+// groupIndependentCalls analyzes tool calls and groups independent ones together
+// so they can be executed in parallel. Calls are dependent if:
+// - A write_file or edit_file targets a path that a previous read_file references
+// - An edit_file targets a path that a previous edit_file or write_file also targets
+// - A bash command might depend on a previous write_file/edit_file
+func (th *ToolHandler) groupIndependentCalls(calls []ToolCall) [][]int {
+	if len(calls) <= 1 {
+		if len(calls) == 1 {
+			return [][]int{{0}}
+		}
+		return nil
+	}
+
+	// Track which paths are written to and which are read from
+	writtenPaths := make(map[string]bool)
+	readPaths := make(map[string]bool)
+
+	// Each batch is a list of indices that can run in parallel
+	var batches [][]int
+	currentBatch := []int{0}
+
+	// Parse the first call to seed written/read paths
+	th.trackPaths(calls[0], writtenPaths, readPaths)
+
+	for i := 1; i < len(calls); i++ {
+		if th.isDependent(calls[i], writtenPaths, readPaths) {
+			// This call depends on a previous one - flush current batch and start new
+			if len(currentBatch) > 0 {
+				batches = append(batches, currentBatch)
+			}
+			currentBatch = []int{i}
+			// Reset tracking for the new batch context
+			writtenPaths = make(map[string]bool)
+			readPaths = make(map[string]bool)
+			th.trackPaths(calls[i], writtenPaths, readPaths)
+		} else {
+			// Independent - can run in same batch
+			currentBatch = append(currentBatch, i)
+			th.trackPaths(calls[i], writtenPaths, readPaths)
+		}
+	}
+
+	if len(currentBatch) > 0 {
+		batches = append(batches, currentBatch)
+	}
+
+	return batches
+}
+
+// isDependent checks if a tool call depends on any previously tracked write/read paths
+func (th *ToolHandler) isDependent(call ToolCall, writtenPaths, readPaths map[string]bool) bool {
+	path, isWrite := th.getCallPathAndType(call)
+	if path == "" {
+		// bash commands are treated as potentially dependent on writes
+		if call.Name == "bash" {
+			return len(writtenPaths) > 0
+		}
+		return false
+	}
+
+	// If this call writes to a path that was already written, it's dependent
+	if isWrite {
+		if writtenPaths[path] {
+			return true
+		}
+		// If this call writes to a path that was previously read by a write-dependent call, it's dependent
+		if readPaths[path] {
+			return true
+		}
+	}
+
+	// If this call reads from a path that was written to, it's dependent
+	if !isWrite && writtenPaths[path] {
+		return true
+	}
+
+	return false
+}
+
+// trackPaths records the paths read/written by a tool call
+func (th *ToolHandler) trackPaths(call ToolCall, writtenPaths, readPaths map[string]bool) {
+	path, isWrite := th.getCallPathAndType(call)
+	if path != "" {
+		if isWrite {
+			writtenPaths[path] = true
+		} else {
+			readPaths[path] = true
+		}
+	}
+}
+
+// getCallPathAndType extracts the target path and whether it's a write operation
+func (th *ToolHandler) getCallPathAndType(call ToolCall) (string, bool) {
+	switch call.Name {
+	case "write_file", "edit_file":
+		var params struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal([]byte(call.Args), &params); err == nil && params.Path != "" {
+			return params.Path, true
+		}
+	case "read_file":
+		var params struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal([]byte(call.Args), &params); err == nil && params.Path != "" {
+			return params.Path, false
+		}
+	case "list_files":
+		var params struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal([]byte(call.Args), &params); err == nil && params.Path != "" {
+			return params.Path, false
+		}
+	case "file_info":
+		var params struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal([]byte(call.Args), &params); err == nil && params.Path != "" {
+			return params.Path, false
+		}
+	case "edit_soul":
+		return "SOUL.md", true
+	}
+	return "", false
 }

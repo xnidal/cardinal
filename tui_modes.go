@@ -68,18 +68,23 @@ func (m Model) handleSlashCommand(cmd string) (tea.Model, tea.Cmd) {
 		return m.undoLastMessage()
 
 	case "/help":
-		help := `Available commands:
-/clear       - Clear chat history
-/undo        - Undo last message pair (user + assistant)
-/models      - Choose a model from the active profile endpoint
-/profiles    - Switch or edit saved profiles
+	help := `Available commands:
+/clear - Clear chat history
+/undo - Undo last message pair (user + assistant)
+/models - Choose a model from the active profile endpoint
+/profiles - Switch or edit saved profiles
 /profile new - Create and activate a new profile
-/profile edit- Edit the active profile
-/endpoint    - Update the active profile endpoint
-/apikey      - Update the active profile API key
-/tools       - List available tools
+/profile edit - Edit the active profile
+/endpoint - Update the active profile endpoint
+/apikey - Update the active profile API key
+/tools - List available tools
 /autoapprove - Toggle auto-approve all tool calls
-/help        - Show this help`
+/help - Show this help
+
+Keyboard shortcuts:
+Ctrl+O - Toggle thinking content visibility
+Ctrl+C - Quit
+Esc - Cancel current request`
 		m.messages = append(m.messages, api.Message{Role: "assistant", Content: help})
 		m.status = "Ready"
 		return m, nil
@@ -509,11 +514,13 @@ func (m Model) updatePermissionsMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.mode = ""
 			m.modeData = nil
 			m.busy = true
-			if approvedToolCount(approvals) == 0 {
-				m.status = "Continuing without tool execution"
-			} else {
-				m.status = "Running approved tools"
-			}
+		if approvedToolCount(approvals) == 0 {
+			m.status = "Continuing without tool execution"
+		} else if approvedToolCount(approvals) > 1 {
+			m.status = fmt.Sprintf("Running %d tools in parallel", approvedToolCount(approvals))
+		} else {
+			m.status = "Running tool"
+		}
 			return m, m.executeToolPlanCmd(data.assistantContent, data.thinkingContent, data.toolCalls, approvals)
 		}
 
