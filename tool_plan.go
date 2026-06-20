@@ -2,6 +2,7 @@ package main
 
 import (
 	"cardinal/pkg/api"
+	"cardinal/pkg/storage"
 	"cardinal/pkg/tools"
 )
 
@@ -13,8 +14,8 @@ func defaultToolApprovals(toolCalls []api.ToolCall) []bool {
 	return approvals
 }
 
-func executeToolPlan(working string, toolCalls []api.ToolCall, approvals []bool, onEditSoul func()) []tools.ToolResult {
-	handler := tools.NewToolHandler(working, onEditSoul)
+func executeToolPlan(working string, todos *storage.TodoStore, toolCalls []api.ToolCall, approvals []bool, onEditSoul func()) []tools.ToolResult {
+	handler := tools.NewToolHandlerWithTodos(working, onEditSoul, todos)
 
 	// Filter to only approved calls, but maintain indices for results
 	approvedCalls := make([]tools.ToolCall, 0, len(toolCalls))

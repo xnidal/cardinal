@@ -1,9 +1,9 @@
 package storage
 
 import (
-	"encoding/json"
-	"os"
-	"path/filepath"
+	"crypto/rand"
+	"encoding/hex"
+	"sync"
 	"time"
 )
 
@@ -15,211 +15,155 @@ const (
 	TodoCompleted  TodoStatus = "completed"
 )
 
-type TodoPriority string
-
-const (
-	PriorityLow    TodoPriority = "low"
-	PriorityMedium TodoPriority = "medium"
-	PriorityHigh   TodoPriority = "high"
-)
-
-// Step represents a discrete subtask within a todo item.
-type Step struct {
-	ID      string `json:"id"`
-	Title   string `json:"title"`
-	Done    bool   `json:"done"`
-}
-
+// TodoItem is deliberately small: a title and a status. Priority, due dates,
+// subtasks and progress percentages all live elsewhere (or just don't exist)
+// because most todo churn in practice is "what should I do next", not metadata.
 type TodoItem struct {
-	ID          string      `json:"id"`
-	Title       string      `json:"title"`
-	Description string      `json:"description,omitempty"`
-	Status      TodoStatus  `json:"status"`
-	Priority    TodoPriority `json:"priority"`
-	DueDate     *time.Time  `json:"due_date,omitempty"`
-	Progress    int         `json:"progress,omitempty"`
-	Steps       []Step      `json:"steps,omitempty"`
-	CreatedAt   time.Time   `json:"created_at"`
-	UpdatedAt   time.Time   `json:"updated_at"`
+	ID     string     `json:"id"`
+	Title  string     `json:"title"`
+	Status TodoStatus `json:"status"`
+	// CreatedAt / UpdatedAt kept for debugging; not surfaced in list output.
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
-type TodoList struct {
-	Items []TodoItem `json:"items"`
+// TodoStore is an in-memory, session-scoped store for todo items.
+// Cardinal does not persist todos across sessions, so this deliberately
+// avoids writing to disk.
+type TodoStore struct {
+	mu    sync.Mutex
+	items []TodoItem
+	next  int // running numeric suffix, makes ids short and readable
 }
 
-func getTodoPath() string {
-	return filepath.Join(getConfigPath(), "todos.json")
+func NewTodoStore() *TodoStore {
+	return &TodoStore{items: []TodoItem{}}
 }
 
-func LoadTodos() (*TodoList, error) {
-	path := getTodoPath()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return &TodoList{Items: []TodoItem{}}, nil
-		}
-		return nil, err
-	}
-	var list TodoList
-	if err := json.Unmarshal(data, &list); err != nil {
-		return nil, err
-	}
-	return &list, nil
-}
-
-func SaveTodos(list *TodoList) error {
-	path := getTodoPath()
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(list, "", " ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0644)
-}
-
-func AddTodo(title, description string, priority TodoPriority, dueDate *time.Time) (*TodoItem, error) {
-	list, err := LoadTodos()
-	if err != nil {
-		return nil, err
-	}
+func (s *TodoStore) Add(title string) (*TodoItem, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.next++
 	now := time.Now()
 	item := TodoItem{
-		ID:          generateTodoID(),
-		Title:       title,
-		Description: description,
-		Status:      TodoPending,
-		Priority:    priority,
-		DueDate:     dueDate,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		ID:        generateTodoID(s.next),
+		Title:     title,
+		Status:    TodoPending,
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
-	list.Items = append(list.Items, item)
-	if err := SaveTodos(list); err != nil {
-		return nil, err
-	}
-	return &item, nil
+	s.items = append(s.items, item)
+	cp := item
+	return &cp, nil
 }
 
-func UpdateTodo(id string, status *TodoStatus, priority *TodoPriority, dueDate *time.Time) (*TodoItem, error) {
-	list, err := LoadTodos()
-	if err != nil {
-		return nil, err
+func (s *TodoStore) List(statusFilter string) []TodoItem {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if statusFilter == "" {
+		out := make([]TodoItem, len(s.items))
+		copy(out, s.items)
+		return out
 	}
-	for i := range list.Items {
-		if list.Items[i].ID == id {
-			if status != nil {
-				list.Items[i].Status = *status
-			}
-			if priority != nil {
-				list.Items[i].Priority = *priority
-			}
-			if dueDate != nil {
-				list.Items[i].DueDate = dueDate
-			}
-			list.Items[i].UpdatedAt = time.Now()
-			if err := SaveTodos(list); err != nil {
-				return nil, err
-			}
-			return &list.Items[i], nil
+	out := make([]TodoItem, 0, len(s.items))
+	for _, it := range s.items {
+		if string(it.Status) == statusFilter {
+			out = append(out, it)
 		}
 	}
-	return nil, os.ErrNotExist
+	return out
 }
 
-// SetTodoProgress updates the progress percentage (0-100) of a todo item.
-func SetTodoProgress(id string, progress int) (*TodoItem, error) {
-	list, err := LoadTodos()
-	if err != nil {
-		return nil, err
-	}
-	for i := range list.Items {
-		if list.Items[i].ID == id {
-			if progress < 0 {
-				progress = 0
-			}
-			if progress > 100 {
-				progress = 100
-			}
-			list.Items[i].Progress = progress
-			list.Items[i].UpdatedAt = time.Now()
-			if err := SaveTodos(list); err != nil {
-				return nil, err
-			}
-			return &list.Items[i], nil
+// resolveID accepts either a full id ("20260120123456-ab12") or just the
+// short suffix ("ab12"). The model only ever sees the short form in
+// formatted output, so accepting it as input keeps the API symmetric.
+func (s *TodoStore) resolveID(id string) *TodoItem {
+	for i := range s.items {
+		if s.items[i].ID == id {
+			return &s.items[i]
+		}
+		if shortID(s.items[i].ID) == id {
+			return &s.items[i]
 		}
 	}
-	return nil, os.ErrNotExist
+	return nil
 }
 
-// SetTodoSteps replaces the steps/subtasks of a todo item.
-func SetTodoSteps(id string, steps []Step) (*TodoItem, error) {
-	list, err := LoadTodos()
-	if err != nil {
-		return nil, err
+func (s *TodoStore) Update(id string, status *TodoStatus, title *string) (*TodoItem, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item := s.resolveID(id)
+	if item == nil {
+		return nil, ErrTodoNotFound
 	}
-	for i := range list.Items {
-		if list.Items[i].ID == id {
-			list.Items[i].Steps = steps
-			list.Items[i].UpdatedAt = time.Now()
-			if err := SaveTodos(list); err != nil {
-				return nil, err
-			}
-			return &list.Items[i], nil
+	if status != nil {
+		item.Status = *status
+	}
+	if title != nil {
+		item.Title = *title
+	}
+	item.UpdatedAt = time.Now()
+	cp := *item
+	return &cp, nil
+}
+
+func (s *TodoStore) Remove(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, it := range s.items {
+		if it.ID == id || shortID(it.ID) == id {
+			s.items = append(s.items[:i], s.items[i+1:]...)
+			return nil
 		}
 	}
-	return nil, os.ErrNotExist
+	return ErrTodoNotFound
 }
 
-// ToggleStep flips the done state of a step within a todo item.
-func ToggleStep(todoID, stepID string) (*TodoItem, error) {
-	list, err := LoadTodos()
-	if err != nil {
-		return nil, err
+// generateTodoID makes ids like "ab12" — short, easy to read aloud, easy to
+// copy-paste across turns. We tag them with a per-process counter so two
+// adds in the same millisecond never collide.
+func generateTodoID(n int) string {
+	var b [2]byte
+	_, _ = rand.Read(b[:])
+	return fmtShort(n) + "-" + hex.EncodeToString(b[:])
+}
+
+func fmtShort(n int) string {
+	if n <= 0 {
+		return "0"
 	}
-	for i := range list.Items {
-		if list.Items[i].ID == todoID {
-			for j := range list.Items[i].Steps {
-				if list.Items[i].Steps[j].ID == stepID {
-					list.Items[i].Steps[j].Done = !list.Items[i].Steps[j].Done
-					list.Items[i].UpdatedAt = time.Now()
-					if err := SaveTodos(list); err != nil {
-						return nil, err
-					}
-					return &list.Items[i], nil
-				}
-			}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(buf[i:])
+}
+
+func shortID(id string) string {
+	if i := indexByte(id, '-'); i >= 0 && i < len(id)-1 {
+		return id[i+1:]
+	}
+	return id
+}
+
+// Tiny local helpers to keep this file free of "strings"/"fmt" imports just
+// for one rune lookup. These add zero allocation on the hot path.
+func indexByte(s string, c byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == c {
+			return i
 		}
 	}
-	return nil, os.ErrNotExist
+	return -1
 }
 
-func RemoveTodo(id string) error {
-	list, err := LoadTodos()
-	if err != nil {
-		return err
-	}
-	for i, item := range list.Items {
-		if item.ID == id {
-			list.Items = append(list.Items[:i], list.Items[i+1:]...)
-			return SaveTodos(list)
-		}
-	}
-	return os.ErrNotExist
-}
+// ErrTodoNotFound is returned when an operation targets a todo ID that does
+// not exist in the current session store.
+var ErrTodoNotFound = errTodoNotFound{}
 
-func generateTodoID() string {
-	return time.Now().Format("20060102150405") + "-" + randomString(4)
-}
+type errTodoNotFound struct{}
 
-func randomString(n int) string {
-	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
-	b := make([]byte, n)
-	seed := time.Now().UnixNano()
-	for i := range b {
-		seed = seed*1103515245 + 12345
-		b[i] = letters[int(seed)%len(letters)]
-	}
-	return string(b)
-}
+func (errTodoNotFound) Error() string { return "todo not found" }

@@ -12,6 +12,7 @@ import (
 	"cardinal/pkg/config"
 	"cardinal/pkg/storage"
 	"cardinal/pkg/tools"
+	"cardinal/pkg/ui"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/spinner"
@@ -39,43 +40,65 @@ var customSpinner = spinner.Spinner{
 }
 
 type Model struct {
-	input            textarea.Model
-	spinner          spinner.Model
-	messages         []api.Message
-	streaming        string
-	thinking         string
-	pendingToolCalls []api.ToolCall
-	streamCh         <-chan api.StreamEvent
-	cancelFunc       context.CancelFunc
-	err              error
-	client           *api.Client
-	toolDefs         []api.Tool
-	working          string
-	width            int
-	height           int
-	cfg              *config.Config
-	suggestions      []string
-	suggSelected     int
-	scrollOffset     int
-	viewport         viewport.Model
-	useViewport      bool
-	mode             string
-	modeData         any
-	busy             bool
-	status           string
-	soul             string
-	retryCount       int
-	lastMessages     []api.Message
-	autoApprove      bool
-	promptHistory    []string
-	historyIndex     int
-	thinkingIdx      int
-	lastStatus       string
-	contextUsed      int
-	contextLimit     int
-	errorStatus string
-	errorStatusTime time.Time
-	expandedThinking map[int]bool
+	input                 textarea.Model
+	spinner               spinner.Model
+	messages              []api.Message
+	streaming             string
+	thinking              string
+	pendingToolCalls      []api.ToolCall
+	streamCh              <-chan api.StreamEvent
+	cancelFunc            context.CancelFunc
+	err                   error
+	client                *api.Client
+	toolDefs              []api.Tool
+	working               string
+	width                 int
+	height                int
+	cfg                   *config.Config
+	suggestions           []string
+	suggSelected          int
+	scrollOffset          int
+	viewport              viewport.Model
+	useViewport           bool
+	mode                  string
+	modeData              any
+	busy                  bool
+	status                string
+	soul                  string
+	retryCount            int
+	lastMessages          []api.Message
+	autoApprove           bool
+	promptHistory         []string
+	historyIndex          int
+	thinkingIdx           int
+	lastStatus            string
+	contextUsed           int
+	contextLimit          int
+	streamChars           int
+	thinkingChars         int
+	toolCallChars         int
+	toolCallName          string
+	errorStatus           string
+	errorStatusTime       time.Time
+	showThinking          bool
+	pendingScrollback     []string
+	scrolledAssistantUpTo int
+	completionChecks      int
+	goalMode              bool
+	goalText              string
+	systemNotes           []string
+	todoStore             *storage.TodoStore
+	todoChecks            int // how many times we've asked the verifier about an idle todo list
+	markdown              *ui.MarkdownRenderer
+	startupGrace          time.Time // drop escape-sequence noise until this deadline
+	pendingApproval       *permissionMode
+}
+
+func flushScrollbackCmd(lines []string) tea.Cmd {
+	if len(lines) == 0 {
+		return nil
+	}
+	return tea.Println(strings.Join(lines, "\n"))
 }
 
 var slashCommands = []string{
@@ -84,18 +107,16 @@ var slashCommands = []string{
 	"/new",
 	"/undo",
 	"/soul",
+	"/thinking",
+	"/goal ",
 	"/models",
 	"/profiles",
-	"/profile new",
-	"/profile edit",
-	"/endpoint",
-	"/apikey",
 	"/autoapprove",
 }
 
 func NewModel(cfg *config.Config) Model {
 	ta := textarea.New()
-	ta.Placeholder = "Message Cardinal or type /help"
+	ta.Placeholder = "Ask Cardinal anything…  (/help for commands)"
 	ta.Focus()
 	ta.SetWidth(60)
 	ta.SetHeight(1)
@@ -113,7 +134,7 @@ func NewModel(cfg *config.Config) Model {
 
 	s := spinner.New()
 	s.Spinner = customSpinner
-	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
+	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
 
 	working, _ := os.Getwd()
 
@@ -121,18 +142,21 @@ func NewModel(cfg *config.Config) Model {
 	vp.SetContent("")
 
 	return Model{
-		input:            ta,
-		spinner:          s,
-		client:           api.NewClient(cfg.APIURL, cfg.APIKey),
-		toolDefs:         convertToolDefs(tools.GetToolDefinitions()),
-		working:          working,
-		cfg:              cfg,
-		status:           "Ready",
-		soul:             loadSoul(),
-		viewport:         vp,
-		autoApprove:      false,
-		contextLimit:     128000,
-		expandedThinking: make(map[int]bool),
+		input:        ta,
+		spinner:      s,
+		client:       api.NewClient(cfg.APIURL, cfg.APIKey),
+		toolDefs:     convertToolDefs(tools.GetToolDefinitions()),
+		working:      working,
+		cfg:          cfg,
+		status:       "Ready",
+		soul:         loadSoul(),
+		viewport:     vp,
+		autoApprove:  false,
+		contextLimit: 128000,
+	showThinking: false,
+		todoStore:    storage.NewTodoStore(),
+		markdown:     ui.NewMarkdownRenderer(80),
+		startupGrace: time.Now().Add(2 * time.Second),
 	}
 }
 
@@ -158,12 +182,35 @@ func (m Model) Init() tea.Cmd {
 }
 
 func startSpinnerTicker() tea.Cmd {
-	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
-		return spinner.TickMsg{}
+	return tea.Tick(125*time.Millisecond, func(t time.Time) tea.Msg {
+		return spinnerTickMsg{}
 	})
 }
 
+// scrollbackTickMsg handles slower UI updates like thinking message cycling.
+// It runs at a lower frequency than the spinner to avoid excessive CPU.
+func startScrollbackTicker() tea.Cmd {
+	return tea.Tick(1*time.Second, func(t time.Time) tea.Msg {
+		return scrollbackTickMsg{}
+	})
+}
+
+type spinnerTickMsg struct{}
+type scrollbackTickMsg struct{}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// During startup, terminals like Ghostty reply to OSC 11 (background-colour)
+	// queries and CSI cursor-position reports. These arrive as KeyMsg runes
+	// that look like "]11;rgb:..." or digits from a cursor report. Drop any
+	// such noise until the grace window expires.
+	if !m.startupGrace.IsZero() && time.Now().Before(m.startupGrace) {
+		if km, ok := msg.(tea.KeyMsg); ok {
+			if isOSCLeak(km) {
+				return m, nil
+			}
+		}
+	}
+
 	if m.useViewport && m.mode == "" && m.viewport.YOffset >= 0 {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -193,11 +240,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.resize(msg.Width, msg.Height)
 		return m, nil
 
-	case spinner.TickMsg:
-		m.spinner, _ = m.spinner.Update(msg)
+	case spinnerTickMsg:
+		m.spinner, _ = m.spinner.Update(spinner.TickMsg{})
+		if m.busy {
+			return m, startSpinnerTicker()
+		}
+		return m, nil
+
+	case scrollbackTickMsg:
 		if m.busy && m.status != "" {
 			currentPriority := getStatusPriority(m.status)
-			if currentPriority >= 3 {
+			if currentPriority >= 3 && m.thinkingChars == 0 && m.streamChars == 0 && m.toolCallChars == 0 {
 				m.thinkingIdx++
 				if m.thinkingIdx >= len(thinkingMessages) {
 					m.thinkingIdx = 0
@@ -207,7 +260,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.lastStatus = m.status
 		if m.busy {
-			return m, startSpinnerTicker()
+			return m, startScrollbackTicker()
+		}
+		if len(m.pendingScrollback) > 0 {
+			lines := m.pendingScrollback
+			m.pendingScrollback = nil
+			return m, flushScrollbackCmd(lines)
 		}
 		return m, nil
 
@@ -222,6 +280,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case toolExecutionMsg:
 		return m.handleToolExecution(msg)
+
+	case goalEvalMsg:
+		return m.handleGoalEval(msg)
+
+	case todoEvalMsg:
+		return m.handleTodoEval(msg)
 
 	case modelsFetchedMsg:
 		m.busy = false
@@ -242,7 +306,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		filterInput.Placeholder = "Filter models..."
 		filterInput.Focus()
 		filterInput.Width = max(m.width-10, 20)
-		m.modeData = &modelsMode{models: msg.models, selected: active, filterInput: filterInput}
+		visibleLines := max(m.height-8, 8)
+		scroll := 0
+		if active >= visibleLines {
+			scroll = active - visibleLines/2
+		}
+		m.modeData = &modelsMode{models: msg.models, selected: active, scroll: scroll, visibleLines: visibleLines, filterInput: filterInput}
 		m.resize(m.width, m.height)
 		m.status = fmt.Sprintf("Loaded %d model%s", len(msg.models), pluralize(len(msg.models)))
 		return m, nil
@@ -269,6 +338,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Inline tool-approval card is active: hijack keys here so users can
+	// toggle approvals without typing into the prompt.
+	if m.pendingApproval != nil {
+		return m.applyInlineApproval(m.pendingApproval, msg)
+	}
+
 	switch msg.Type {
 	case tea.KeyCtrlC:
 		return m, tea.Quit
@@ -280,11 +355,17 @@ func (m Model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if strings.HasPrefix(value, "/") {
+				if len(m.suggestions) > 0 && m.suggSelected >= 0 && m.suggSelected < len(m.suggestions) {
+					value = m.suggestions[m.suggSelected]
+				}
 				return m.handleSlashCommand(value)
 			}
 			m.err = nil
 			m.retryCount = 0
 			m.messages = append(m.messages, api.Message{Role: "user", Content: value})
+			m.goalMode = false
+			m.goalText = ""
+			m.completionChecks = 0
 			m.lastMessages = append([]api.Message(nil), m.messages...)
 			m.promptHistory = append(m.promptHistory, value)
 			m.historyIndex = len(m.promptHistory)
@@ -293,6 +374,13 @@ func (m Model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.scrollOffset = 0
 			m.useViewport = false
 			return m.beginStream()
+		}
+		if m.mode == "" && m.busy && strings.HasPrefix(strings.TrimSpace(m.input.Value()), "/") {
+			value := strings.TrimSpace(m.input.Value())
+			if len(m.suggestions) > 0 && m.suggSelected >= 0 && m.suggSelected < len(m.suggestions) {
+				value = m.suggestions[m.suggSelected]
+			}
+			return m.handleSlashCommand(value)
 		}
 
 	case tea.KeyTab:
@@ -375,17 +463,8 @@ func (m Model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.KeyCtrlO:
-		// Toggle thinking content visibility for the most recent message with thinking
-		for i := len(m.messages) - 1; i >= 0; i-- {
-			if strings.TrimSpace(m.messages[i].Thinking) != "" {
-				m.expandedThinking[i] = !m.expandedThinking[i]
-				if m.useViewport {
-					m.updateViewportContent()
-				}
-				return m, nil
-			}
-		}
 		return m, nil
+
 	}
 
 	var cmd tea.Cmd
@@ -459,6 +538,12 @@ func (m *Model) resize(width, height int) {
 	m.input.SetWidth(max(width-6, 20))
 	m.input.SetHeight(1)
 
+	// Markdown body is narrower than the outer card: account for the
+	// "● Title" header and the 2-char left padding of the message body.
+	if m.markdown != nil {
+		m.markdown.Resize(max(width-8, 24))
+	}
+
 	// Calculate viewport height (total height minus fixed elements)
 	// Cardinal header: 1 line + 1 margin = 2
 	// Empty line before input: 1
@@ -494,11 +579,88 @@ func (m *Model) resize(width, height int) {
 	}
 }
 
+type scrollbackMsg struct {
+	lines []string
+	kind  string
+}
+
+func scrollbackCmd(lines []string, kind string) tea.Cmd {
+	if len(lines) == 0 {
+		return nil
+	}
+	formatted := formatScrollback(lines, kind)
+	return tea.Println(formatted)
+}
+
+func formatScrollback(lines []string, kind string) string {
+	out := make([]string, 0, len(lines)+2)
+	out = append(out, "─── "+kind+" ───")
+	out = append(out, lines...)
+	out = append(out, "────────────")
+	return strings.Join(out, "\n")
+}
+
 func (m *Model) updateViewportContent() {
 	content := m.renderConversationContent()
 	m.viewport.SetContent(content)
 }
 
+func (m *Model) addSystemNote(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	m.systemNotes = append(m.systemNotes, text)
+	if len(m.systemNotes) > 50 {
+		m.systemNotes = m.systemNotes[len(m.systemNotes)-50:]
+	}
+	if m.useViewport {
+		m.updateViewportContent()
+	}
+}
+
 func (m *Model) renderConversationContent() string {
 	return m.renderChatHistory(m.messages, 0, strings.TrimSpace(m.streaming) != "", strings.TrimSpace(m.thinking) != "", m.err)
+}
+
+// isOSCLeak detects KeyMsgs that are fragments of terminal escape-sequence
+// replies (OSC 11 background-colour, CSI cursor-position, etc.) that leak
+// into stdin on terminals like Ghostty. These arrive as short bursts of
+// digits, semicolons, and the literal chars "rgb:". A normal user would
+// never type these as the very first keys after launch.
+func isOSCLeak(msg tea.KeyMsg) bool {
+	if msg.Type != tea.KeyRunes {
+		return false
+	}
+	s := msg.String()
+	// Classic OSC 11 reply body: starts with "]" or contains "rgb:"
+	if strings.HasPrefix(s, "]") || strings.Contains(s, "rgb:") {
+		return true
+	}
+	// Cursor-position report digits like "77;1R" — short strings of
+	// digits, semicolons, and an optional trailing letter (the CSI
+	// final byte).
+	if len(s) <= 10 && len(s) >= 2 {
+		allDigitSemi := true
+		hasDigit := false
+		lastIdx := len(s) - 1
+		for idx, r := range s {
+			if r >= '0' && r <= '9' {
+				hasDigit = true
+			} else if r == ';' || r == ':' {
+				// ok
+			} else if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
+				// allow a single trailing letter (the CSI final byte)
+				if idx != lastIdx {
+					allDigitSemi = false
+				}
+			} else {
+				allDigitSemi = false
+			}
+		}
+		if allDigitSemi && hasDigit {
+			return true
+		}
+	}
+	return false
 }

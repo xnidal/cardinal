@@ -15,49 +15,35 @@ import (
 )
 
 var (
-	accentColor  = lipgloss.Color("6")
-	primaryColor = lipgloss.Color("5")
-	successColor = lipgloss.Color("2")
-	warningColor = lipgloss.Color("3")
-	errorColor   = lipgloss.Color("1")
-	dimColor     = lipgloss.Color("8")
+	accentColor  = lipgloss.Color("63")
+	userColor    = lipgloss.Color("42")
+	aiColor      = lipgloss.Color("213")
+	toolColor    = lipgloss.Color("214")
+	successColor = lipgloss.Color("42")
+	warningColor = lipgloss.Color("214")
+	errorColor   = lipgloss.Color("196")
+	dimColor     = lipgloss.Color("244")
+	panelColor   = lipgloss.Color("238")
 
-	titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(accentColor).
-			Padding(0, 1)
+	dimStyle      = lipgloss.NewStyle().Foreground(dimColor)
+	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(accentColor)
+	subtitleStyle = lipgloss.NewStyle().Foreground(dimColor)
+	errorStyle    = lipgloss.NewStyle().Foreground(errorColor).Bold(true)
+	successStyle  = lipgloss.NewStyle().Foreground(successColor).Bold(true)
+	toolStyle     = lipgloss.NewStyle().Foreground(toolColor).Bold(true)
 
-	subtitleStyle = lipgloss.NewStyle().
-			Foreground(dimColor).
-			Italic(true)
+	// Diff rendering: proper unified-diff with single-character prefixes.
+	// Foreground colors keep the +/- legible against any theme.
+	addStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
+	delStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+	ctxDiffStyle = dimStyle
 
-	dimStyle = lipgloss.NewStyle().Foreground(dimColor)
-
-	errorStyle = lipgloss.NewStyle().
-			Foreground(errorColor).
-			Background(lipgloss.Color("52")).
-			Bold(true).
-			Padding(0, 1)
-
-	toolStyle = lipgloss.NewStyle().
-			Foreground(warningColor).
-			Background(lipgloss.Color("235"))
-
-	successStyle = lipgloss.NewStyle().
-			Foreground(successColor).
-			Bold(true)
-
-	userMessageStyle = lipgloss.NewStyle().
-				Foreground(successColor).
-				PaddingLeft(2)
-
-	assistantMessageStyle = lipgloss.NewStyle().
-				Foreground(primaryColor).
-				PaddingLeft(2)
+	userMessageStyle      = lipgloss.NewStyle().Foreground(userColor)
+	assistantMessageStyle = lipgloss.NewStyle().Foreground(aiColor)
 
 	boxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(dimColor).
+			BorderForeground(panelColor).
 			Padding(0, 1)
 
 	inputBoxStyle = lipgloss.NewStyle().
@@ -67,20 +53,32 @@ var (
 
 	headerBoxStyle = lipgloss.NewStyle().
 			Border(lipgloss.NormalBorder()).
-			BorderForeground(accentColor).
-			BorderBottom(true).
-			MarginBottom(1)
+			BorderForeground(panelColor).
+			BorderBottom(true)
 )
 
 func (m Model) View() string {
 	if m.mode != "" {
-		return m.renderMode()
+		return m.renderShell(m.renderMode())
 	}
 	return m.renderMainView()
 }
 
+func (m Model) renderShell(body string) string {
+	header := m.renderHeader()
+	if header == "" {
+		return body
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, header, body)
+}
+
 func (m Model) renderMainView() string {
 	sections := []string{m.renderHeader()}
+
+	// Inline tool-approval card (replaces the legacy full-screen perms page).
+	if m.pendingApproval != nil {
+		sections = append(sections, m.renderInlineApproval())
+	}
 
 	if m.useViewport && m.viewport.Height > 0 {
 		sections = append(sections, m.viewport.View())
@@ -91,50 +89,92 @@ func (m Model) renderMainView() string {
 	if len(m.suggestions) > 0 {
 		sections = append(sections, m.renderSuggestions())
 	}
-
-	sections = append(sections, "")
-
 	if m.busy {
 		sections = append(sections, m.renderThrobber())
 	}
 
-	sections = append(sections, m.renderInput(), m.renderFooter())
-
+	sections = append(sections, "", m.renderModelRule(), m.renderInput())
 	return lipgloss.JoinVertical(lipgloss.Left, sections...)
 }
 
-func (m Model) renderThrobber() string {
-	status := m.status
-	if status == "" {
-		status = "Working..."
+// renderModelRule is the divider row between the chat / approval card and
+// the prompt. It shows context usage on the left and the current model name
+// on the right.
+func (m Model) renderModelRule() string {
+	width := max(m.width, 40)
+	var left string
+	if m.contextUsed > 0 && m.contextLimit > 0 {
+		pct := int(float64(m.contextUsed) / float64(m.contextLimit) * 100)
+		left = lipgloss.NewStyle().Foreground(dimColor).Render("ctx " + strconv.Itoa(pct) + "%")
+	} else {
+		left = lipgloss.NewStyle().Foreground(dimColor).Render(strings.Repeat("─", 4))
 	}
+	model := m.cfg.Model
+	if model == "" {
+		model = "no model"
+	}
+	right := lipgloss.NewStyle().Foreground(dimColor).Render(model)
+	leftWidth := lipgloss.Width(left)
+	rightWidth := lipgloss.Width(right)
+	gap := max(width-leftWidth-rightWidth-2, 4)
+	rule := lipgloss.NewStyle().Foreground(panelColor).Render(strings.Repeat("─", gap))
+	return left + " " + rule + " " + right
+}
 
+func (m Model) renderInlineApproval() string {
+	data := m.pendingApproval
+	var rows []string
+	rows = append(rows,
+		titleStyle.Render("Approve tools")+"  "+dimStyle.Render("Space toggle · a allow · r reject · A all · R none · Enter run · Esc skip"))
+	for i, tc := range data.toolCalls {
+		prefix := "  "
+		if i == data.selected {
+			prefix = "› "
+		}
+		mark := lipgloss.NewStyle().Foreground(errorColor).Render("✗")
+		if data.approvals[i] {
+			mark = lipgloss.NewStyle().Foreground(successColor).Render("✓")
+		}
+		line := fmt.Sprintf("%s%s %s", prefix, mark, tc.Function.Name)
+		args := oneLine(tc.Function.Arguments, max(m.width-14, 30))
+		if args != "" {
+			line += dimStyle.Render("  " + args)
+		}
+		if i == data.selected {
+			line = lipgloss.NewStyle().Foreground(accentColor).Bold(true).Render(line)
+		}
+		rows = append(rows, line)
+	}
+	body := strings.Join(rows, "\n")
+	return modePanel(m.width, body)
+}
+
+func (m Model) renderHeader() string {
+	return ""
+}
+
+func (m Model) renderThrobber() string {
+	status := strings.TrimSpace(m.status)
+	if status == "" {
+		status = "Working"
+	}
 	color := getStatusColor(status)
-	throbberStyle := lipgloss.NewStyle().Foreground(color).Bold(true)
-
-	spinner := throbberStyle.Render(m.spinner.View())
-	statusText := lipgloss.NewStyle().Foreground(color).Render(status)
-
-	return spinner + " " + statusText
+	return lipgloss.NewStyle().Foreground(color).Bold(true).Render(m.spinner.View() + " " + status)
 }
 
 func getStatusColor(status string) lipgloss.Color {
 	lower := strings.ToLower(status)
 	switch {
-	case strings.Contains(lower, "thinking") || strings.Contains(lower, "hmmm") || strings.Contains(lower, "ponder") || strings.Contains(lower, "comput") || strings.Contains(lower, "process") || strings.Contains(lower, "load"):
-		return lipgloss.Color("81")
-	case strings.Contains(lower, "receiving") || strings.Contains(lower, "writing"):
-		return lipgloss.Color("177")
-	case strings.Contains(lower, "running") || strings.Contains(lower, "continu"):
-		return lipgloss.Color("215")
-	case strings.Contains(lower, "error") || strings.Contains(lower, "fail") || strings.Contains(lower, "denied"):
-		return lipgloss.Color("196")
-	case strings.Contains(lower, "permission") || strings.Contains(lower, "approve"):
-		return lipgloss.Color("213")
-	case strings.Contains(lower, "ready") || strings.Contains(lower, "updated"):
-		return lipgloss.Color("78")
+	case strings.Contains(lower, "error"), strings.Contains(lower, "fail"), strings.Contains(lower, "denied"):
+		return errorColor
+	case strings.Contains(lower, "permission"), strings.Contains(lower, "approve"):
+		return aiColor
+	case strings.Contains(lower, "running"), strings.Contains(lower, "tool"), strings.Contains(lower, "retry"):
+		return warningColor
+	case strings.Contains(lower, "ready"), strings.Contains(lower, "updated"), strings.Contains(lower, "saved"):
+		return successColor
 	default:
-		return lipgloss.Color("248")
+		return accentColor
 	}
 }
 
@@ -151,1210 +191,936 @@ func (m Model) renderMode() string {
 	case "permissions":
 		return m.renderPermissionsMode()
 	default:
-		return m.renderMainView()
+		return m.renderConversation()
 	}
-}
-
-func (m Model) renderHeader() string {
-	return lipgloss.NewStyle().
-		Foreground(accentColor).
-		Bold(true).
-		MarginBottom(1).
-		Render("Cardinal")
 }
 
 func (m Model) renderConversation() string {
 	hasStreaming := strings.TrimSpace(m.streaming) != ""
 	hasThinking := strings.TrimSpace(m.thinking) != ""
-
-	if len(m.messages) == 0 && !hasStreaming && !hasThinking && m.err == nil {
+	if len(m.messages) == 0 && !hasStreaming && !hasThinking && m.err == nil && len(m.systemNotes) == 0 {
 		return m.renderWelcome()
 	}
+	var body string
+	if len(m.messages) == 0 && !hasStreaming && !hasThinking && m.err == nil {
+		body = m.renderSystemNotes()
+	} else {
+		body = m.renderChatHistory(m.messages, m.scrollOffset, hasStreaming, hasThinking, m.err)
+		body = joinWithSystemNotes(body, m.renderSystemNotes())
+	}
+	return body
+}
 
-	return m.renderChatHistory(m.messages, m.scrollOffset, hasStreaming, hasThinking, m.err)
+func (m Model) renderSystemNotes() string {
+	if len(m.systemNotes) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(m.systemNotes))
+	for _, note := range m.systemNotes {
+		glyph := lipgloss.NewStyle().Foreground(accentColor).Bold(true).Render("✦")
+		text := lipgloss.NewStyle().Foreground(dimColor).Render(" " + note)
+		parts = append(parts, glyph+text)
+	}
+	return strings.Join(parts, "\n")
+}
+
+func joinWithSystemNotes(chat, notes string) string {
+	chat = strings.TrimRight(chat, "\n")
+	notes = strings.TrimRight(notes, "\n")
+	switch {
+	case chat == "" && notes == "":
+		return ""
+	case chat == "":
+		return notes
+	case notes == "":
+		return chat
+	default:
+		return notes + "\n\n" + chat
+	}
 }
 
 func (m Model) renderChatHistory(messages []api.Message, scrollOffset int, hasStreaming, hasThinking bool, chatErr error) string {
-	if len(messages) == 0 && !hasStreaming && !hasThinking && chatErr == nil {
+	var blocks []string
+	i := 0
+	for i < len(messages) {
+		msg := messages[i]
+		if msg.Role == "tool" {
+			run := m.collectToolRun(messages, i)
+			if rendered := m.renderToolRun(run); rendered != "" {
+				blocks = append(blocks, rendered)
+			}
+			i += run.count
+			continue
+		}
+		if rendered := m.renderMessage(i, msg); rendered != "" {
+			blocks = append(blocks, rendered)
+		}
+		i++
+	}
+	if hasThinking || hasStreaming {
+		blocks = append(blocks, m.renderStreamingMessage())
+	}
+	if chatErr != nil {
+		blocks = append(blocks, m.messageCardPlain("Error", errorColor, chatErr.Error()))
+	}
+	if len(blocks) == 0 {
 		return m.renderWelcome()
 	}
-
-	var blocks []string
-
-	// Always show model info at the top
-	modelInfo := lipgloss.NewStyle().
-		Foreground(dimColor).
-		Render(m.cfg.ActiveProfileName() + " > " + m.cfg.Model + " @ " + compactEndpoint(m.cfg.APIURL))
-	blocks = append(blocks, modelInfo, "")
-
-	for i, message := range messages {
-		if rendered := m.renderMessage(i, message); rendered != "" {
-			blocks = append(blocks, "\n"+rendered)
-		}
-	}
-
-	if hasThinking || hasStreaming {
-		blocks = append(blocks, "\n"+m.renderStreamingMessage())
-	}
-
-	if chatErr != nil {
-		errorBox := lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(errorColor).
-			Padding(0, 1).
-			Render("⚠ Error: " + chatErr.Error())
-		blocks = append(blocks, errorBox)
-	}
-
-	return lipgloss.JoinVertical(lipgloss.Left, blocks...)
+	return strings.Join(blocks, "\n\n")
 }
 
 func (m Model) renderWelcome() string {
-	asciiArt := []string{
-		"_________                  .___.__              .__   ",
-		"\\_   ___ \\_____ _______  __| _/|__| ____ _____  |  |  ",
-		"/    \\  \\/\\__  \\_  __ \\/ __ | |  |/    \\__  \\ |  |  ",
-		"\\     \\____/ __ \\|  | \\/ /_/ | |  |   |  \\/ __ \\|  |__",
-		" \\______  (____  /__|  \\____ | |__|___|  (____  /____/",
-		"        \\/     \\/           \\/         \\/     \\/      ",
+	width := min(max(m.width-4, 62), 96)
+	logo := []string{
+		"  _________                  .___.__              .__                               ",
+		"  \\_   ___ \\_____ _______  __| _/|__| ____ _____  |  |                              ",
+		"  /    \\  \\/\\__  \\_  __ \\ / __ | |  |/    \\__   \\ |  |                             ",
+		"  \\     \\____/ __ \\|  | \\/ /_/ | |  |   |  \\/ __ \\|  |__                           ",
+		"   \\______  (____  /__|  \\____ | |__|___|  (____  /____/                            ",
+		"          \\/     \\/           \\/         \\/     \\/                                  ",
 	}
-
-	commands := []struct {
-		cmd  string
-		desc string
-	}{
-		{"/profiles", "switch provider"},
-		{"/models", "pick a model"},
-		{"/autoapprove", "toggle auto-approve"},
-		{"/help", "all commands"},
+	for i, line := range logo {
+		logo[i] = lipgloss.NewStyle().Foreground(accentColor).Bold(true).Render(line)
 	}
-
-	var lines []string
-
-	lines = append(lines,
-		lipgloss.NewStyle().
-			Foreground(dimColor).
-			Render(m.cfg.ActiveProfileName()+" > "+m.cfg.Model+" @ "+compactEndpoint(m.cfg.APIURL)),
-	)
-
-	lines = append(lines, "")
-
-	asciiStyle := lipgloss.NewStyle().
-		Foreground(accentColor).
-		Bold(true).
-		MarginLeft(2)
-
-	for _, line := range asciiArt {
-		lines = append(lines, asciiStyle.Render(line))
+	commands := []string{
+		lipgloss.NewStyle().Foreground(accentColor).Render("/models") + dimStyle.Render("       choose model"),
+		lipgloss.NewStyle().Foreground(accentColor).Render("/profiles") + dimStyle.Render("     switch endpoint/profile"),
+		lipgloss.NewStyle().Foreground(accentColor).Render("/autoapprove") + dimStyle.Render("  run tools without prompts"),
+		lipgloss.NewStyle().Foreground(accentColor).Render("/help") + dimStyle.Render("         show commands"),
 	}
-
-	lines = append(lines, "")
-
-	lines = append(lines,
-		lipgloss.NewStyle().
-			Foreground(accentColor).
-			Bold(true).
-			Render("Start a conversation"),
-	)
-
-	for _, c := range commands {
-		lines = append(lines,
-			lipgloss.NewStyle().
-				Foreground(primaryColor).
-				Render(c.cmd)+
-				lipgloss.NewStyle().
-					Foreground(dimColor).
-					Render("  "+c.desc),
-		)
-	}
-
-	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+	body := strings.Join(logo, "\n") + "\n\n" +
+		dimStyle.Render("Ready to code") + "\n" +
+		dimStyle.Render("Ask for edits, debugging, refactors, command output, or code search.") + "\n\n" +
+		strings.Join(commands, "\n") + "\n\n" +
+		dimStyle.Render("Enter sends · Esc cancels · ↑/↓ prompt history")
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(panelColor).
+		Padding(1, 2).
+		Width(width).
+		Render(body)
 }
 
 func (m Model) renderMessage(msgIndex int, msg api.Message) string {
 	if msg.Role == "system" {
 		return ""
 	}
-
 	if msg.Role == "tool" {
-		return m.renderToolResult(msg)
+		return ""
 	}
 
 	label, color := roleMeta(msg)
 	content := strings.TrimSpace(msg.Content)
 	thinking := strings.TrimSpace(msg.Thinking)
-
-	if content == "" && thinking == "" && len(msg.ToolCalls) == 0 {
-		return ""
+	var parts []string
+	if thinking != "" && m.showThinking {
+		preview := oneLine(thinking, max(m.width-12, 24))
+		parts = append(parts, m.messageCardPlain(label+" thinking", dimColor, preview))
 	}
-
-	var icon string = ">"
-
-	var blocks []string
-
-	// Render thinking section if present
-	if thinking != "" {
-		expanded := m.expandedThinking[msgIndex]
-		var arrow string
-		if expanded {
-			arrow = "▾"
-		} else {
-			arrow = "▸"
-		}
-		thinkingLabel := lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("8")).
-			MaxWidth(m.width).
-			Render(icon + " " + label + " [thinking] " + arrow)
-
-		if expanded {
-		thinkingBox := lipgloss.NewStyle().
-			PaddingLeft(3).
-			Width(max(m.width-4, 20)).
-			MaxWidth(m.width).
-			Italic(true).
-			Foreground(lipgloss.Color("8")).
-			Render(thinking)
-		blocks = append(blocks, thinkingLabel)
-		blocks = append(blocks, thinkingBox)
-	} else {
-		// Collapsed: show a preview that fits on one line
-		// Calculate available width: total width minus the label prefix and (ctrl+o) suffix
-		prefixText := icon + " " + label + " [thinking] " + arrow + " "
-		suffixText := " (ctrl+o)"
-		labelWidth := len(prefixText) // label uses basic ASCII chars + arrow
-		suffixWidth := len(suffixText)
-		previewMaxWidth := max(m.width-labelWidth-suffixWidth-2, 20) // -2 for safety margin
-
-		preview := thinking
-		firstNewline := strings.Index(thinking, "\n")
-		if firstNewline > 0 && firstNewline < previewMaxWidth {
-			preview = thinking[:firstNewline]
-		} else if len(preview) > previewMaxWidth {
-			preview = preview[:max(previewMaxWidth-3, 0)] + "..."
-		}
-
-		collapsedLine := prefixText + preview + suffixText
-		collapsedLabel := lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("8")).
-			MaxWidth(m.width).
-			Render(collapsedLine)
-		blocks = append(blocks, collapsedLabel)
-	}
-	}
-
-	// Render content section if present
 	if content != "" {
-	contentLabel := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(color).
-		MaxWidth(m.width).
-		Render(icon + " " + label)
-
-	contentBox := lipgloss.NewStyle().
-		PaddingLeft(3).
-		Width(max(m.width-4, 20)).
-		MaxWidth(m.width).
-		Render(content)
-
-		blocks = append(blocks, contentLabel)
-		blocks = append(blocks, contentBox)
+		if msg.Role == "user" && !looksLikeMarkdown(content) {
+			parts = append(parts, m.messageCardPlain(label, color, content))
+		} else {
+			parts = append(parts, m.messageCard(label, color, content))
+		}
 	}
+	return strings.Join(parts, "\n")
+}
 
-	return lipgloss.JoinVertical(lipgloss.Left, blocks...)
+func (m Model) messageCard(title string, color lipgloss.Color, content string) string {
+	return m.messageCardRendered(title, color, content, true)
+}
+
+// messageCardPlain is the legacy raw-text variant. Tool results already go
+// through formatToolSummary (which produces colorized diffs/bullets/etc.); we
+// don't want to feed that back through a markdown renderer.
+func (m Model) messageCardPlain(title string, color lipgloss.Color, content string) string {
+	return m.messageCardRendered(title, color, content, false)
+}
+
+func (m Model) messageCardRendered(title string, color lipgloss.Color, content string, useMarkdown bool) string {
+	width := max(m.width-4, 30)
+	header := lipgloss.NewStyle().Foreground(color).Bold(true).Render("● " + title)
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return header
+	}
+	body := content
+	if useMarkdown && m.markdown != nil {
+		// Glamour's renderer respects WithWordWrap, but it also emits
+		// hard-wrapped blocks (headings, tables) at the configured width.
+		body = m.markdown.Render(content)
+	}
+	body = lipgloss.NewStyle().PaddingLeft(2).Width(width).Render(body)
+	return header + "\n" + body
 }
 
 func (m Model) renderToolResult(msg api.Message) string {
-	toolName := msg.Name
-	if toolName == "" {
-		toolName = "tool"
-	}
+	return ""
+}
 
-	maxHeight := 10
-	maxWidth := max(m.width-4, 20)
+type toolRun struct {
+	start int
+	count int
+	name  string
+	args  []string
+	seq   []api.Message
+}
 
-	var content string
-
-	switch toolName {
-	case "read_file":
-		var path string
-		var offset int
-		var limit int
-		if msg.ToolArgs != "" {
-			var params struct {
-				Path   string `json:"path"`
-				Offset int    `json:"offset,omitempty"`
-				Limit  int    `json:"limit,omitempty"`
-			}
-			if err := json.Unmarshal([]byte(msg.ToolArgs), &params); err == nil {
-				path = params.Path
-				if params.Offset > 0 {
-					offset = params.Offset
-				}
-				if params.Limit > 0 {
-					limit = params.Limit
-				}
-			}
+func (m Model) collectToolRun(messages []api.Message, start int) toolRun {
+	run := toolRun{start: start, name: messages[start].Name}
+	for i := start; i < len(messages); i++ {
+		msg := messages[i]
+		if msg.Role != "tool" || msg.Name != run.name {
+			break
 		}
-		displayPath := m.formatPath(path)
-		if offset > 0 || limit > 0 {
-			linesInfo := fmt.Sprintf("%d-%d", offset+1, offset+limit)
-			content = lipgloss.NewStyle().
-				Foreground(accentColor).
-				Render("> read " + displayPath + " [" + linesInfo + "]")
+		var args map[string]any
+		_ = json.Unmarshal([]byte(msg.ToolArgs), &args)
+		run.seq = append(run.seq, msg)
+		run.count++
+		if paths, ok := args["paths"].([]any); ok && len(paths) > 0 {
+			// read_files: collect each normalised path
+			for _, p := range paths {
+				if s, ok := p.(string); ok && s != "" {
+					run.args = append(run.args, normalisePath(s))
+				}
+			}
+		} else if path := stringArg(args, "path"); path != "" {
+			run.args = append(run.args, normalisePath(path))
+		} else if pat := stringArg(args, "pattern"); pat != "" {
+			run.args = append(run.args, pat)
+		} else if cmd := stringArg(args, "command"); cmd != "" {
+			run.args = append(run.args, oneLine(cmd, 40))
+		} else if expr := stringArg(args, "expression"); expr != "" {
+			run.args = append(run.args, expr)
 		} else {
-			content = lipgloss.NewStyle().
-				Foreground(accentColor).
-				Render("> read " + displayPath)
+			run.args = append(run.args, "-")
 		}
-
-	case "list_files":
-		var path string
-		if msg.ToolArgs != "" {
-			var params struct {
-				Path string `json:"path"`
-			}
-			if err := json.Unmarshal([]byte(msg.ToolArgs), &params); err == nil {
-				path = params.Path
-			}
-		}
-		displayPath := m.formatPath(path)
-		if displayPath == "" {
-			displayPath = "."
-		}
-
-		lines := strings.Split(msg.Content, "\n")
-		// Skip the [list_files] header if present
-		if len(lines) > 0 && strings.TrimSpace(lines[0]) == "[list_files]" {
-			lines = lines[1:]
-		}
-		if len(lines) > maxHeight {
-			lines = append(lines[:maxHeight],
-				lipgloss.NewStyle().
-					Foreground(warningColor).
-					Italic(true).
-					Render(fmt.Sprintf(" ... %d more results", len(lines)-maxHeight)),
-			)
-		}
-
-		var formattedLines []string
-		for _, line := range lines {
-			if len(line) > maxWidth {
-				line = line[:maxWidth-3] + "..."
-			}
-			if strings.TrimSpace(line) != "" {
-				formattedLines = append(formattedLines, line)
-			}
-		}
-
-		header := lipgloss.NewStyle().
-			Foreground(accentColor).
-			Render("> list " + displayPath)
-
-		content = header + "\n" + lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(dimColor).
-			Padding(0, 1).
-			Width(maxWidth).
-			Render(strings.Join(formattedLines, "\n"))
-
-	case "bash":
-		content = m.formatBashOutput(msg.Content, msg.ToolArgs, maxHeight, maxWidth)
-
-	case "write_file":
-		content = m.formatWriteFileOutput(msg.Content, msg.ToolArgs, maxHeight, maxWidth)
-
-	case "edit_file":
-		content = m.formatEditFileOutput(msg.Content, msg.ToolArgs, maxHeight, maxWidth)
-
-	case "grep":
-		content = m.formatGrepOutput(msg.Content, msg.ToolArgs, maxHeight, maxWidth)
-
-	case "glob":
-		content = m.formatGlobOutput(msg.Content, msg.ToolArgs, maxHeight, maxWidth)
-
-	case "file_info":
-		content = m.formatFileInfoOutput(msg.Content, msg.ToolArgs, maxHeight, maxWidth)
-
-	case "edit_soul":
-		content = lipgloss.NewStyle().
-			Foreground(accentColor).
-			Render("> edit_soul")
-
-	case "calculate":
-		content = m.formatCalculateOutput(msg.Content, msg.ToolArgs, maxHeight, maxWidth)
-
-	case "subagent", "subagent_status", "subagent_list", "subagent_clear":
-		content = m.formatSubagentOutput(msg.Content, maxHeight, maxWidth)
-
-	default:
-		content = m.formatDefaultToolOutput(msg.Content, maxHeight, maxWidth)
 	}
-
-	return lipgloss.NewStyle().
-		PaddingLeft(2).
-		MaxWidth(m.width).
-		Render(content)
+	return run
 }
 
-func (m Model) formatBashOutput(content, toolArgs string, maxHeight, maxWidth int) string {
-	var command string
-	if toolArgs != "" {
-		var params struct {
-			Command string `json:"command"`
-		}
-		if err := json.Unmarshal([]byte(toolArgs), &params); err == nil {
-			command = params.Command
-		}
-	}
-
-	// If no output, just show the header
-	if strings.TrimSpace(content) == "" {
-		header := "> bash"
-		if command != "" {
-			displayCmd := command
-			if len(displayCmd) > maxWidth-10 {
-				displayCmd = displayCmd[:maxWidth-13] + "..."
-			}
-			header = "> bash: " + displayCmd
-		}
-		return lipgloss.NewStyle().Foreground(accentColor).Render(header + " (no output)")
-	}
-
-	lines := strings.Split(content, "\n")
-	if len(lines) > maxHeight {
-		lines = append(lines[:maxHeight],
-			lipgloss.NewStyle().
-				Foreground(warningColor).
-				Italic(true).
-				Render(fmt.Sprintf(" ... %d more lines", len(lines)-maxHeight)),
-		)
-	}
-
-	var formattedLines []string
-	for _, line := range lines {
-		if len(line) > maxWidth {
-			line = line[:maxWidth-3] + "..."
-		}
-		if strings.TrimSpace(line) != "" {
-			formattedLines = append(formattedLines, line)
-		}
-	}
-
-	header := "> bash"
-	if command != "" {
-		// Truncate long commands
-		displayCmd := command
-		if len(displayCmd) > maxWidth-10 {
-			displayCmd = displayCmd[:maxWidth-13] + "..."
-		}
-		header = "> bash: " + displayCmd
-	}
-
-	return lipgloss.NewStyle().
-		Foreground(accentColor).
-		Render(header) + "\n" +
-		lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(dimColor).
-			Padding(0, 1).
-			Width(maxWidth).
-			Render(strings.Join(formattedLines, "\n"))
-}
-
-func (m Model) formatWriteFileOutput(content, toolArgs string, maxHeight, maxWidth int) string {
-	// Parse path from tool arguments
-	var path string
-	if toolArgs != "" {
-		var params struct {
-			Path string `json:"path"`
-		}
-		if err := json.Unmarshal([]byte(toolArgs), &params); err == nil {
-			path = params.Path
-		}
-	}
-	// Fallback to extracting from content if path not in args
-	if path == "" {
-		path = extractPathFromToolResult(content)
-	}
-	displayPath := m.formatPath(path)
-	header := lipgloss.NewStyle().Foreground(accentColor).Render("> write " + displayPath)
-
-	trimmedContent := strings.TrimSpace(content)
-	if trimmedContent == "" || trimmedContent == "Success" {
-		return header
-	}
-	if strings.HasPrefix(trimmedContent, "Error:") {
-		return header + "\n" + lipgloss.NewStyle().Foreground(errorColor).Render(trimmedContent)
-	}
-	if len(trimmedContent) > maxWidth {
-		trimmedContent = trimmedContent[:maxWidth-3] + "..."
-	}
-	return header + "\n" + lipgloss.NewStyle().Foreground(dimColor).Render(" "+trimmedContent)
-}
-
-func (m Model) formatCalculateOutput(content, toolArgs string, maxHeight, maxWidth int) string {
-	var expression string
-	if toolArgs != "" {
-		var params struct {
-			Expression string `json:"expression"`
-		}
-		if err := json.Unmarshal([]byte(toolArgs), &params); err == nil {
-			expression = params.Expression
-		}
-	}
-
-	lines := strings.Split(content, "\n")
-	var outputLines []string
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line != "" && !strings.HasPrefix(line, "[") {
-			outputLines = append(outputLines, line)
-		}
-	}
-	if len(outputLines) > maxHeight {
-		outputLines = append(outputLines[:maxHeight], fmt.Sprintf("... %d more", len(outputLines)-maxHeight))
-	}
-
-	result := strings.Join(outputLines, " ")
-
-	if expression != "" && result != "" {
-		return lipgloss.NewStyle().
-			Foreground(accentColor).
-			Render("> calculate " + expression + " = " + result)
-	} else if expression != "" {
-		return lipgloss.NewStyle().
-			Foreground(accentColor).
-			Render("> calculate " + expression)
-	} else if result != "" {
-		return lipgloss.NewStyle().
-			Foreground(accentColor).
-			Render("> calculate: " + result)
-	}
-	return lipgloss.NewStyle().Foreground(accentColor).Render("> calculate")
-}
-
-func (m Model) formatEditFileOutput(content, toolArgs string, maxHeight, maxWidth int) string {
-	// Parse path from tool arguments
-	var path string
-	if toolArgs != "" {
-		var params struct {
-			Path string `json:"path"`
-		}
-		if err := json.Unmarshal([]byte(toolArgs), &params); err == nil {
-			path = params.Path
-		}
-	}
-	// Fallback to extracting from content if path not in args
-	if path == "" {
-		path = extractPathFromToolResult(content)
-	}
-	displayPath := m.formatPath(path)
-
-	lines := strings.Split(content, "\n")
-	var diffLines []string
-	for _, line := range lines {
-		if strings.HasPrefix(line, "-") || strings.HasPrefix(line, "+") || strings.HasPrefix(line, " ") {
-			diffLines = append(diffLines, line)
-		}
-	}
-
-	if len(diffLines) > maxHeight {
-		diffLines = append(diffLines[:maxHeight], fmt.Sprintf("... %d more changes", len(lines)-maxHeight))
-	}
-
-	// Build header
-	header := lipgloss.NewStyle().Foreground(accentColor).Render("> edit " + displayPath)
-
-	if len(diffLines) > 0 {
-		var coloredDiff []string
-		for _, line := range diffLines {
-			if strings.HasPrefix(line, "-") {
-				coloredDiff = append(coloredDiff,
-					lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Render(" "+line),
-				)
-			} else if strings.HasPrefix(line, "+") {
-				coloredDiff = append(coloredDiff,
-					lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render(" "+line),
-				)
-			} else {
-				coloredDiff = append(coloredDiff,
-					lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(" "+line),
-				)
-			}
-		}
-		return header + "\n" + strings.Join(coloredDiff, "\n")
-	}
-
-	// No diff lines found - check if it's an error or just no diff
-	if strings.Contains(content, "Error:") || strings.Contains(content, "error") {
-		errorContent := content
-		if idx := strings.Index(content, "Error:"); idx >= 0 {
-			errorContent = content[idx:]
-		}
-		return header + "\n" + lipgloss.NewStyle().Foreground(errorColor).Render(errorContent)
-	}
-	if strings.TrimSpace(content) != "" {
-		return header + "\n" + lipgloss.NewStyle().Foreground(dimColor).Render(content)
-	}
-	return header + "\n" + lipgloss.NewStyle().Foreground(dimColor).Render(" (no diff to display)")
-}
-
-func (m Model) formatGrepOutput(content, toolArgs string, maxHeight, maxWidth int) string {
-	// Parse all grep parameters from tool arguments
-	var pattern, path, include string
-	if toolArgs != "" {
-		var params struct {
-			Pattern string `json:"pattern"`
-			Path    string `json:"path"`
-			Include string `json:"include"`
-		}
-		if err := json.Unmarshal([]byte(toolArgs), &params); err == nil {
-			pattern = params.Pattern
-			path = params.Path
-			include = params.Include
-		}
-	}
-
-	lines := strings.Split(content, "\n")
-	// Count actual matches
-	matchCount := 0
-	for _, line := range lines {
-		if strings.HasPrefix(line, "> ") {
-			matchCount++
-		}
-	}
-
-	// Build header with pattern, include, path, and count
-	var parts []string
-	if pattern != "" {
-		parts = append(parts, "\""+pattern+"\"")
-	}
-	if include != "" {
-		parts = append(parts, "in "+include)
-	}
-	if path != "" {
-		parts = append(parts, "("+path+")")
-	}
-
-	headerText := "* Grep"
-	if len(parts) > 0 {
-		headerText += " " + strings.Join(parts, " ")
-	}
-	if matchCount == 1 {
-		headerText += " (1 match)"
-	} else if matchCount > 0 {
-		headerText += " (" + strconv.Itoa(matchCount) + " matches)"
-	} else if content == "No matches found" {
-		headerText += " (no matches)"
-	}
-
-	return lipgloss.NewStyle().
-		Foreground(accentColor).
-		Render(headerText)
-}
-
-func (m Model) formatGlobOutput(content, toolArgs string, maxHeight, maxWidth int) string {
-	var pattern string
-	var path string
-	if toolArgs != "" {
-		var params struct {
-			Pattern string `json:"pattern"`
-			Path    string `json:"path"`
-		}
-		if err := json.Unmarshal([]byte(toolArgs), &params); err == nil {
-			pattern = params.Pattern
-			path = params.Path
-		}
-	}
-
-	displayPath := m.formatPath(path)
-	if displayPath == "" {
-		displayPath = "."
-	}
-
-	lines := strings.Split(content, "\n")
-	var files []string
-	for _, line := range lines {
-		if strings.TrimSpace(line) != "" {
-			files = append(files, line)
-		}
-	}
-
-	if len(files) > maxHeight {
-		files = append(files[:maxHeight],
-			lipgloss.NewStyle().
-				Foreground(warningColor).
-				Italic(true).
-				Render(fmt.Sprintf(" ... %d more results", len(files)-maxHeight)),
-		)
-	}
-
-	var formattedLines []string
-	for _, line := range files {
-		if len(line) > maxWidth-4 {
-			line = line[:maxWidth-7] + "..."
-		}
-		formattedLines = append(formattedLines,
-			lipgloss.NewStyle().
-				Foreground(dimColor).
-				Render(" "+line),
-		)
-	}
-
-	headerText := "* Glob"
-	if pattern != "" {
-		headerText = "* Glob \"" + pattern + "\""
-		if displayPath != "." {
-			headerText += " in " + displayPath
-		}
-	} else if displayPath != "." {
-		headerText = "* Glob in " + displayPath
-	}
-	headerText += fmt.Sprintf(" (%d result%s)", len(files), pluralize(len(files)))
-
-	header := lipgloss.NewStyle().
-		Foreground(accentColor).
-		Render(headerText)
-
-	if len(formattedLines) == 0 {
-		return header
-	}
-
-	outputBox := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(dimColor).
-		Padding(0, 1).
-		Width(maxWidth).
-		Render(strings.Join(formattedLines, "\n"))
-
-	return header + "\n" + outputBox
-}
-
-func (m Model) formatFileInfoOutput(content, toolArgs string, maxHeight, maxWidth int) string {
-	var path string
-	if toolArgs != "" {
-		var params struct {
-			Path string `json:"path"`
-		}
-		if err := json.Unmarshal([]byte(toolArgs), &params); err == nil {
-			path = params.Path
-		}
-	}
-
-	displayPath := m.formatPath(path)
-	if displayPath == "" {
-		displayPath = "file"
-	}
-
-	return lipgloss.NewStyle().Foreground(accentColor).Render("> file_info " + displayPath)
-}
-
-func (m Model) formatDefaultToolOutput(content string, maxHeight, maxWidth int) string {
-	lines := strings.Split(content, "\n")
-	if len(lines) > maxHeight {
-		lines = append(lines[:maxHeight],
-			lipgloss.NewStyle().
-				Foreground(warningColor).
-				Italic(true).
-				Render(fmt.Sprintf("  ... %d more lines", len(lines)-maxHeight)),
-		)
-	}
-
-	var formattedLines []string
-	for _, line := range lines {
-		if len(line) > maxWidth {
-			line = line[:maxWidth-3] + "..."
-		}
-		if strings.TrimSpace(line) != "" {
-			formattedLines = append(formattedLines,
-				lipgloss.NewStyle().Foreground(dimColor).Render("  "+line),
-			)
-		}
-	}
-
-	return strings.Join(formattedLines, "\n")
-}
-
-func (m Model) formatSubagentOutput(content string, maxHeight, maxWidth int) string {
-	re := regexp.MustCompile(`<subagent_task id="([^"]*)" profile="([^"]*)" status="([^"]*)">`)
-	matches := re.FindStringSubmatch(content)
-
-	var taskID, profile, status string
-	if len(matches) >= 4 {
-		taskID = matches[1]
-		profile = matches[2]
-		status = matches[3]
-	}
-
-	headerStyle := lipgloss.NewStyle().
-		Foreground(accentColor).
-		Bold(true)
-
-	statusColor := successColor
-	if status == "running" {
-		statusColor = warningColor
-	} else if status == "failed" {
-		statusColor = errorColor
-	}
-
-	header := headerStyle.Render("> subagent") + " " +
-		lipgloss.NewStyle().Foreground(dimColor).Render(taskID) + " " +
-		lipgloss.NewStyle().Foreground(statusColor).Render("["+status+"]") + " " +
-		lipgloss.NewStyle().Foreground(accentColor).Render(profile)
-
-	var bodyLines []string
-	rePrompt := regexp.MustCompile(`<prompt>([^<]*)</prompt>`)
-	reThinking := regexp.MustCompile(`<thinking>([^<]*)</thinking>`)
-	reMessage := regexp.MustCompile(`<message role="([^"]*)">([^<]*)</message>`)
-	reToolCall := regexp.MustCompile(`<tool_call name="([^"]*)">([^<]*)</tool_call>`)
-	reToolResult := regexp.MustCompile(`<tool_result name="([^"]*)">([^<]*)</tool_result>`)
-	reResult := regexp.MustCompile(`<result>([^<]*)</result>`)
-	reError := regexp.MustCompile(`<error>([^<]*)</error>`)
-
-	if promptMatch := rePrompt.FindStringSubmatch(content); len(promptMatch) >= 2 {
-		bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(accentColor).Bold(true).Render("  ▼ Prompt"))
-		truncated := promptMatch[1]
-		if len(truncated) > maxWidth-4 {
-			truncated = truncated[:maxWidth-7] + "..."
-		}
-		bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(dimColor).Render("    "+truncated))
-	}
-
-	for _, match := range reThinking.FindAllStringSubmatch(content, -1) {
-		if len(match) >= 2 {
-			thinking := match[1]
-			if len(thinking) > maxWidth-4 {
-				thinking = thinking[:maxWidth-7] + "..."
-			}
-			bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Render("  ◍ thinking"))
-			bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Italic(true).Render("    "+thinking))
-		}
-	}
-
-	for _, match := range reMessage.FindAllStringSubmatch(content, -1) {
-		if len(match) >= 3 {
-			role := match[1]
-			msgContent := match[2]
-			if len(msgContent) > maxWidth-4 {
-				msgContent = msgContent[:maxWidth-7] + "..."
-			}
-			roleColor := successColor
-			if role == "user" {
-				roleColor = accentColor
-			}
-			bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(roleColor).Render("  > "+role))
-			bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(dimColor).Render("    "+msgContent))
-		}
-	}
-
-	for _, match := range reToolCall.FindAllStringSubmatch(content, -1) {
-		if len(match) >= 3 {
-			toolName := match[1]
-			toolArgs := match[2]
-			if len(toolArgs) > maxWidth-4 {
-				toolArgs = toolArgs[:maxWidth-7] + "..."
-			}
-			bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(warningColor).Render("  ◉ tool: "+toolName))
-			bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(dimColor).Render("    "+toolArgs))
-		}
-	}
-
-	for _, match := range reToolResult.FindAllStringSubmatch(content, -1) {
-		if len(match) >= 3 {
-			toolName := match[1]
-			toolResult := match[2]
-			if len(toolResult) > maxWidth-4 {
-				toolResult = toolResult[:maxWidth-7] + "..."
-			}
-			bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(successColor).Render("  ◉ result: "+toolName))
-			bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(dimColor).Render("    "+toolResult))
-		}
-	}
-
-	if resultMatch := reResult.FindStringSubmatch(content); len(resultMatch) >= 2 {
-		result := resultMatch[1]
-		resultLines := strings.Split(result, "\n")
-		for i, line := range resultLines {
-			if len(line) > maxWidth-4 {
-				line = line[:maxWidth-7] + "..."
-			}
-			if i == 0 {
-				bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(successColor).Bold(true).Render("  ✓ Result"))
-			}
-			bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(dimColor).Render("    "+line))
-		}
-	}
-
-	if errorMatch := reError.FindStringSubmatch(content); len(errorMatch) >= 2 {
-		bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(errorColor).Bold(true).Render("  ✕ Error"))
-		bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(errorColor).Render("    "+errorMatch[1]))
-	}
-
-	if len(bodyLines) > maxHeight {
-		keepCount := maxHeight - 1
-		truncLine := lipgloss.NewStyle().
-			Foreground(warningColor).
-			Italic(true).
-			Render(fmt.Sprintf("  ... %d more lines", len(bodyLines)-keepCount))
-		bodyLines = append([]string{truncLine}, bodyLines[len(bodyLines)-keepCount:]...)
-	}
-
-	var formattedBody []string
-	for _, line := range bodyLines {
-		formattedBody = append(formattedBody, line)
-	}
-
-	boxStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(dimColor).
-		Padding(0, 1).
-		Width(maxWidth)
-
-	return header + "\n" + boxStyle.Render(strings.Join(formattedBody, "\n"))
-}
-
-func extractPathFromToolResult(content string) string {
-	lines := strings.Split(content, "\n")
-	if len(lines) >= 2 {
-		pathLine := strings.TrimSpace(lines[1])
-		if pathLine != "" && !strings.HasPrefix(pathLine, "[") && !strings.HasPrefix(pathLine, "Error:") {
-			return pathLine
-		}
-	}
-	for _, line := range lines {
-		if strings.HasPrefix(line, "[") {
-			parts := strings.SplitN(line, " ", 2)
-			if len(parts) >= 2 {
-				rest := parts[1]
-				if !strings.HasPrefix(rest, "Error:") {
-					rest = strings.TrimSuffix(rest, "\n")
-					if strings.Contains(rest, "\n") {
-						rest = strings.SplitN(rest, "\n", 2)[0]
-					}
-					return rest
-				}
-			}
-		}
-		if strings.Contains(line, "path=") {
-			_, after, _ := strings.Cut(line, "path=")
-			rest := after
-			if idx := strings.Index(rest, "\""); idx > 0 {
-				rest = rest[:idx]
-			}
-			return rest
-		}
-	}
-	return ""
-}
-
-func extractLinesFromToolResult(content string) string {
-	lines := strings.SplitSeq(content, "\n")
-	for line := range lines {
-		if strings.Contains(line, "(") && strings.Contains(line, ")") {
-			start := strings.Index(line, "(")
-			end := strings.Index(line, ")")
-			if start > 0 && end > start {
-				return line[start+1 : end]
-			}
-		}
-		if strings.Contains(line, "lines=") {
-			_, after, _ := strings.Cut(line, "lines=")
-			rest := after
-			if idx := strings.Index(rest, "\""); idx > 0 {
-				rest = rest[:idx]
-			}
-			return rest
-		}
-	}
-	return ""
-}
-
-func (m Model) formatPath(path string) string {
-	// Make path relative to working directory if possible
-	if strings.HasPrefix(path, m.working) {
-		rel, err := filepath.Rel(m.working, path)
-		if err == nil && !strings.HasPrefix(rel, "..") {
-			return "./" + rel
-		}
-	}
-	return path
-}
-
-func (m Model) renderStreamingMessage() string {
-	thinking := strings.TrimSpace(m.thinking)
-	streaming := strings.TrimSpace(m.streaming)
-
-	var blocks []string
-
-	// Render thinking section if present
-	if thinking != "" {
-		blocks = append(blocks, lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("8")).MaxWidth(m.width).Render("> Cardinal [thinking]"))
-		blocks = append(blocks, lipgloss.NewStyle().PaddingLeft(4).Width(max(m.width-4, 20)).MaxWidth(m.width).Italic(true).Foreground(lipgloss.Color("8")).Render(thinking))
-	}
-
-	// Render streaming section if present
-	if streaming != "" {
-		blocks = append(blocks, lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("5")).MaxWidth(m.width).Render("> Cardinal"))
-		blocks = append(blocks, lipgloss.NewStyle().PaddingLeft(4).Width(max(m.width-4, 20)).MaxWidth(m.width).Render(streaming))
-	}
-
-	if len(blocks) == 0 {
+func (m Model) renderToolRun(run toolRun) string {
+	if run.count == 0 {
 		return ""
 	}
 
-	return strings.Join(blocks, "\n")
+	// edit_file: show the colourised diff directly (no bullet prefix)
+	if run.name == "edit_file" {
+		var parts []string
+		for _, msg := range run.seq {
+			preview := m.formatToolSummary(msg, max(m.width-8, 32))
+			if preview != "" {
+				parts = append(parts, preview)
+			}
+		}
+		return m.messageCardPlain(groupTitle(run.name, dedupArgs(run.name, run.args)), toolColor, strings.Join(parts, "\n"))
+	}
+
+	// Single read: just a bold title, no tree behind it.
+	if run.name == "read_files" {
+		if len(run.args) == 1 {
+			title := "● " + groupTitle(run.name, run.args)
+			return lipgloss.NewStyle().Foreground(toolColor).Bold(true).Render(title)
+		}
+		tree := m.renderReadFilesTree(run)
+		if tree == "" {
+			return ""
+		}
+		return m.messageCardPlain(groupTitle(run.name, run.args), toolColor, tree)
+	}
+
+	// bash: collapse trivial `cat <file>…` invocations into a Read.
+	if run.name == "bash" {
+		if files := bashCatFiles(run); files != nil {
+			title := groupTitle("read_files", files)
+			out := formatCatOutput(run)
+			return m.messageCardPlain(title, toolColor, out)
+		}
+		args := dedupArgs(run.name, run.args)
+		title := groupTitle(run.name, args)
+		body := formatBashOutput(run)
+		if body == "" {
+			return ""
+		}
+		return m.messageCardPlain(title, toolColor, body)
+	}
+
+	// todo tools: render each run as a small tool card. A bare checklist
+	// would float unattributed and read as part of the assistant's reply; we
+	// want it to look like a tool result, even if the "title" is constant.
+	if isTodoTool(run.name) {
+		// todo_write returns the *full current list* on every call, so the
+		// last snapshot supersedes earlier ones in the same run. Showing all
+		// of them would repeat identical content.
+		last := ""
+		for _, msg := range run.seq {
+			if preview := m.formatToolSummary(msg, max(m.width-8, 32)); preview != "" {
+				last = preview
+			}
+		}
+		if last == "" {
+			return ""
+		}
+		return m.messageCardPlain("Todos", toolColor, last)
+	}
+
+	args := dedupArgs(run.name, run.args)
+	title := groupTitle(run.name, args)
+	bodyLines := []string{}
+	for i, msg := range run.seq {
+		preview := m.formatToolSummary(msg, max(m.width-8, 32))
+		if preview != "" {
+			bodyLines = append(bodyLines, "  • "+preview)
+			if i >= 3 {
+				break
+			}
+		}
+	}
+	return m.messageCardPlain(title, toolColor, strings.Join(bodyLines, "\n"))
+}
+
+// bashCatFiles returns the list of paths being `cat`'d if the entire run is
+// a sequence of `cat <file>…` invocations (and nothing else). Returns nil
+// if any call uses a different command or flags, so unrelated bash work
+// keeps the regular "Ran <cmd>" rendering.
+func bashCatFiles(run toolRun) []string {
+	if run.name != "bash" || len(run.seq) == 0 {
+		return nil
+	}
+	var files []string
+	for _, msg := range run.seq {
+		var args struct {
+			Command string `json:"command"`
+		}
+		if err := json.Unmarshal([]byte(msg.ToolArgs), &args); err != nil {
+			return nil
+		}
+		cmd := strings.TrimSpace(args.Command)
+		// strip any leading `command ` builtin prefix used to bypass aliases
+		cmd = strings.TrimPrefix(cmd, "command ")
+		if cmd == "" {
+			return nil
+		}
+		fields := strings.Fields(cmd)
+		if len(fields) < 2 || fields[0] != "cat" {
+			return nil
+		}
+		// reject any flag; `cat -n foo` etc. shouldn't be silently collapsed
+		for _, f := range fields[1:] {
+			if strings.HasPrefix(f, "-") {
+				return nil
+			}
+			files = append(files, normalisePath(f))
+		}
+	}
+	return files
+}
+
+// formatBashOutput strips the duplicate "$ cmd" replay from a tool body
+// because the title already shows the command. Falls back to plain content.
+func formatBashOutput(run toolRun) string {
+	var parts []string
+	for _, msg := range run.seq {
+		body := strings.TrimSpace(msg.Content)
+		if body == "" {
+			continue
+		}
+		parts = append(parts, compactLines(body, 12, 200))
+	}
+	return strings.Join(parts, "\n")
+}
+
+// formatCatOutput preserves the cat'd body verbatim — it's the only
+// interesting signal of a Read-from-bash.
+func formatCatOutput(run toolRun) string {
+	var parts []string
+	for _, msg := range run.seq {
+		body := strings.TrimSpace(msg.Content)
+		if body == "" {
+			continue
+		}
+		parts = append(parts, body)
+	}
+	return strings.Join(parts, "\n")
+}
+
+func isTodoTool(name string) bool {
+	switch name {
+	case "todo_write", "todo_read":
+		return true
+	}
+	return false
+}
+
+func (m Model) renderReadFilesTree(run toolRun) string {
+	if len(run.seq) == 0 {
+		return ""
+	}
+	// Use the last call's metadata: read_files returns the full set on every
+	// consecutive call so showing the latest snapshot is the right behaviour.
+	msg := run.seq[len(run.seq)-1]
+	if strings.TrimSpace(msg.MetaLines) == "" || strings.TrimSpace(msg.MetaLines) == "[]" {
+		return ""
+	}
+	type entry struct {
+		Path      string `json:"path"`
+		Range     string `json:"range,omitempty"`
+		Truncated bool   `json:"truncated,omitempty"`
+		Error     string `json:"error,omitempty"`
+	}
+	var entries []entry
+	if err := json.Unmarshal([]byte(msg.MetaLines), &entries); err != nil || len(entries) == 0 {
+		return ""
+	}
+
+	last := len(entries) - 1
+	lines := []string{}
+	for i, e := range entries {
+		glyph := "├─"
+		if i == last {
+			glyph = "└─"
+		}
+		switch {
+		case e.Error != "":
+			lines = append(lines, fmt.Sprintf("%s %s — %s", glyph, normalisePath(e.Path), e.Error))
+		case e.Range != "":
+			display := e.Path + " (" + e.Range + ")"
+			if e.Truncated {
+				display += " …"
+			}
+			lines = append(lines, glyph+" "+display)
+		default:
+			// Full file: just the path, no parenthetical.
+			lines = append(lines, glyph+" "+e.Path)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func dedupArgs(name string, args []string) []string {
+	if len(args) == 0 {
+		return args
+	}
+	switch name {
+	case "read_files", "write_file", "edit_file", "file_info", "glob", "list_files":
+	default:
+		return args
+	}
+	counts := map[string]int{}
+	order := []string{}
+	for _, a := range args {
+		if a == "-" {
+			counts["_other"]++
+			order = append(order, "_other")
+			continue
+		}
+		if counts[a] == 0 {
+			order = append(order, a)
+		}
+		counts[a]++
+	}
+	out := make([]string, 0, len(order))
+	for _, a := range order {
+		if n := counts[a]; n > 1 && a != "_other" {
+			out = append(out, fmt.Sprintf("%s \u00d7%d", a, n))
+		} else if a == "_other" {
+			out = append(out, fmt.Sprintf("(other) \u00d7%d", counts["_other"]))
+		} else {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func groupTitle(name string, args []string) string {
+	switch name {
+	case "list_files":
+		return toolGroupName("Listed files in", args)
+	case "read_files":
+		if len(args) == 1 {
+			return "Read " + args[0]
+		}
+		return fmt.Sprintf("Read %d files", len(args))
+	case "write_file":
+		return toolGroupName("Wrote", args)
+	case "edit_file":
+		return toolGroupName("Edited", args)
+	case "bash":
+		return toolGroupName("Ran", args)
+	case "grep":
+		return toolGroupName("Searched", args)
+	case "glob":
+		return toolGroupName("Matched", args)
+	case "file_info":
+		return toolGroupName("Inspected", args)
+	case "calculate":
+		return toolGroupName("Calculated", args)
+	default:
+		return toolGroupName(name, args)
+	}
+}
+
+func toolGroupName(prefix string, args []string) string {
+	if len(args) == 0 {
+		return prefix
+	}
+	if len(args) == 1 {
+		return prefix + " " + args[0]
+	}
+	return prefix + " " + strings.Join(args, ", ")
+}
+
+func (m Model) renderToolResultAt(msgIndex int, msg api.Message) string {
+	name := msg.Name
+	if name == "" {
+		name = "tool"
+	}
+	body := m.formatToolSummary(msg, max(m.width-8, 32))
+	return m.messageCardPlain(m.toolDisplayTitle(msg), toolColor, body)
+}
+
+func (m Model) toolDisplayTitle(msg api.Message) string {
+	args := map[string]any{}
+	_ = json.Unmarshal([]byte(msg.ToolArgs), &args)
+	path := stringArg(args, "path")
+	if path != "" {
+		path = m.formatPath(path)
+	}
+	switch msg.Name {
+	case "list_files":
+		if path == "" {
+			path = "."
+		}
+		return "Listed files in " + path
+	case "read_files":
+		path := stringArg(args, "path")
+		if paths, ok := args["paths"].([]any); ok && len(paths) > 0 {
+			strs := make([]string, 0, len(paths))
+			for _, p := range paths {
+				if s, ok := p.(string); ok {
+					strs = append(strs, normalisePath(s))
+				}
+			}
+			if len(strs) == 1 {
+				return "Read " + strs[0]
+			}
+			return fmt.Sprintf("Read %d files", len(strs))
+		}
+		if path != "" {
+			return "Read " + normalisePath(path)
+		}
+		return "Read"
+	case "write_file":
+		return "Wrote " + path
+	case "edit_file":
+		return "Edited " + path
+	case "bash":
+		cmd := stringArg(args, "command")
+		if cmd != "" {
+			return "Ran " + oneLine(cmd, 60)
+		}
+		return "Ran command"
+	case "grep":
+		return "Searched " + stringArg(args, "pattern")
+	case "glob":
+		return "Found files matching " + stringArg(args, "pattern")
+	case "file_info":
+		return "Inspected " + path
+	case "calculate":
+		return "Calculated " + stringArg(args, "expression")
+	case "set_goal":
+		goal := stringArg(args, "goal")
+		if goal != "" {
+			return "Goal: " + oneLine(goal, 80)
+		}
+		return "Set goal"
+	case "yes":
+		summary := stringArg(args, "summary")
+		if summary != "" {
+			return "Finished: " + oneLine(summary, 80)
+		}
+		return "Finished task"
+	case "format_error":
+		return "Corrected tool-call format"
+	default:
+		return msg.Name
+	}
+}
+
+func (m Model) formatToolExpanded(msg api.Message, width int) string {
+	args := strings.TrimSpace(msg.ToolArgs)
+	content := strings.TrimSpace(msg.Content)
+	if args != "" {
+		return dimStyle.Render("args: "+args) + "\n" + compactLines(content, 0, width)
+	}
+	return compactLines(content, 0, width)
+}
+
+func (m Model) formatToolSummary(msg api.Message, width int) string {
+	args := map[string]any{}
+	_ = json.Unmarshal([]byte(msg.ToolArgs), &args)
+	path := stringArg(args, "path")
+	if path != "" {
+		path = m.formatPath(path)
+	}
+
+	summary := ""
+	showOutput := true
+	switch msg.Name {
+	case "bash":
+		summary = "$ " + stringArg(args, "command")
+		showOutput = strings.TrimSpace(msg.Content) != ""
+	case "read_files":
+		summary = ""
+		showOutput = false
+	case "write_file":
+		summary = ""
+		showOutput = false
+	case "edit_file":
+		diff := strings.TrimSpace(msg.Content)
+		if diff != "" {
+			return renderDiff(diff, width)
+		}
+		showOutput = false
+	case "file_info":
+		summary = ""
+		showOutput = false
+	case "list_files":
+		if path == "" {
+			path = "."
+		}
+		summary = ""
+		showOutput = false
+	case "grep":
+		summary = ""
+		showOutput = false
+	case "glob":
+		summary = ""
+		showOutput = false
+	case "calculate":
+		summary = ""
+		showOutput = false
+	case "set_goal", "yes":
+		summary = ""
+		showOutput = false
+	case "edit_soul":
+		summary = ""
+		showOutput = false
+	case "todo_write", "todo_read":
+		// Todo tools return a natural checklist; render it directly. We
+		// strip the per-line "#xxxx" short id because it's noise for a human
+		// reader (looks like a git hash or hex color); the model still has
+		// the id available in the raw tool output it received, and the todo
+		// verifier feedback uses it explicitly.
+		content := strings.TrimRight(msg.Content, "\n")
+		if strings.TrimSpace(content) == "" {
+			return ""
+		}
+		return stripTodoIDs(content)
+	default:
+		summary = compactLines(msg.Content, 4, width)
+	}
+
+	if !showOutput {
+		return summary
+	}
+	out := compactLines(msg.Content, 12, width)
+	if strings.TrimSpace(out) == "" || strings.TrimSpace(out) == strings.TrimSpace(summary) {
+		return summary
+	}
+	if summary == "" {
+		return out
+	}
+	return summary + "\n" + dimStyle.Render(out)
+}
+
+func stringArg(args map[string]any, key string) string {
+	if v, ok := args[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func compactLines(content string, maxLines, maxWidth int) string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return ""
+	}
+	lines := strings.Split(content, "\n")
+	if maxLines > 0 && len(lines) > maxLines {
+		lines = lines[:maxLines]
+	}
+	for i := range lines {
+		lines[i] = oneLine(lines[i], maxWidth)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func oneLine(s string, maxWidth int) string {
+	s = strings.ReplaceAll(strings.TrimSpace(s), "\n", " ")
+	if maxWidth <= 3 || len(s) <= maxWidth {
+		return s
+	}
+	return s[:maxWidth-3] + "..."
+}
+
+// normalisePath strips a leading "./" from a path so that "./foo.go"
+// and "foo.go" always display as the same form.
+func normalisePath(p string) string {
+	for strings.HasPrefix(p, "./") || strings.HasPrefix(p, ".\\") {
+		p = strings.TrimPrefix(p, "./")
+		p = strings.TrimPrefix(p, ".\\")
+	}
+	return p
+}
+
+// todoIDSuffixRE matches the trailing "  #xxxx" short-id stamp that the
+// model-visible checklist uses to address items. The UI drops it; the raw
+// tool output keeps it.
+var todoIDSuffixRE = regexp.MustCompile(`[ \t]+#[A-Za-z0-9]{2,}\s*$`)
+
+// stripTodoIDs removes the trailing #xxxx short id from each line of a
+// checklist. Trailing whitespace gets collapsed, otherwise the lines are
+// otherwise left untouched so they still line up in the UI.
+func stripTodoIDs(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = todoIDSuffixRE.ReplaceAllString(line, "")
+	}
+	return strings.Join(lines, "\n")
+}
+
+// renderDiff colourises a unified-diff produced by formatDiff. Each input
+// line starts with a single marker character (' ', '+' or '-') followed by
+// the line-number columns and the line text. The marker drives the colour
+// choice; the remaining body is preserved verbatim so the rendered lines
+// stay aligned in the TUI.
+func renderDiff(content string, width int) string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return ""
+	}
+	lines := strings.Split(content, "\n")
+	const maxLines = 40
+	if len(lines) > maxLines {
+		lines = lines[:maxLines]
+		lines = append(lines, dimStyle.Render(fmt.Sprintf("   ... %d more lines ...", len(lines)-maxLines)))
+	}
+	var styled []string
+	for _, line := range lines {
+		if width > 0 && len(line) > width {
+			line = line[:width-3] + "..."
+		}
+		if line == "" {
+			styled = append(styled, dimStyle.Render(""))
+			continue
+		}
+		marker := line[0]
+		switch marker {
+		case '+':
+			styled = append(styled, addStyle.Render(line))
+		case '-':
+			styled = append(styled, delStyle.Render(line))
+		default:
+			styled = append(styled, dimStyle.Render(line))
+		}
+	}
+	return strings.Join(styled, "\n")
+}
+
+func (m Model) formatPath(path string) string {
+	if strings.HasPrefix(path, m.working) {
+		if rel, err := filepath.Rel(m.working, path); err == nil && !strings.HasPrefix(rel, "..") {
+			return normalisePath(rel)
+		}
+	}
+	return normalisePath(path)
+}
+
+func (m Model) renderStreamingMessage() string {
+	var parts []string
+	if streaming := strings.TrimSpace(m.streaming); streaming != "" {
+		parts = append(parts, m.messageCard("Cardinal", aiColor, streaming))
+	}
+	return strings.Join(parts, "\n")
 }
 
 func (m Model) renderSuggestions() string {
 	if len(m.suggestions) == 0 {
 		return ""
 	}
-
-	var items []string
+	items := make([]string, 0, len(m.suggestions))
 	for i, s := range m.suggestions {
 		if i == m.suggSelected {
-			items = append(items, lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Render("→ "+s))
+			items = append(items, lipgloss.NewStyle().Foreground(accentColor).Bold(true).Render("› "+s))
 		} else {
 			items = append(items, dimStyle.Render("  "+s))
 		}
 	}
-
-	return "\n" + strings.Join(items, "\n")
+	return lipgloss.NewStyle().MarginLeft(1).Render(strings.Join(items, "\n"))
 }
 
 func (m Model) renderModelsMode() string {
 	data := m.modeData.(*modelsMode)
-
-	var lines []string
-	lines = append(lines, titleStyle.Render("Select Model"))
-	lines = append(lines, "")
-
-	// Apply filter to models
+	data.filter = strings.TrimSpace(data.filterInput.Value())
+	clampModelsMode(data)
 	filtered := filterModels(data.models, data.filter)
-
-	for i, model := range filtered {
-		if i < data.scroll {
-			continue
-		}
-		if i >= data.scroll+data.visibleLines {
-			break
-		}
-
-		prefix := " "
+	var rows []string
+	rows = append(rows, titleStyle.Render("Choose model"), dimStyle.Render("Type to filter · Enter select · Esc cancel"), "")
+	if len(filtered) == 0 {
+		rows = append(rows, dimStyle.Render("No models found"))
+	}
+	visible := data.visibleLines
+	if visible <= 0 {
+		visible = 12
+	}
+	for i := data.scroll; i < len(filtered) && i < data.scroll+visible; i++ {
+		name := filtered[i].ID
+		prefix := "  "
+		style := dimStyle
 		if i == data.selected {
-			prefix = "→ "
+			prefix = "› "
+			style = lipgloss.NewStyle().Foreground(accentColor).Bold(true)
 		}
-
-		modelName := model.ID
-		if i == data.selected {
-			modelName = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Render(modelName)
-		} else {
-			modelName = dimStyle.Render(modelName)
-		}
-
-		lines = append(lines, prefix+modelName)
+		rows = append(rows, prefix+style.Render(name))
 	}
-
-	if data.scroll > 0 && len(lines) > 2 {
-		lines[2] = dimStyle.Render(" ↑ more above")
-	}
-
-	if len(filtered) > data.scroll+data.visibleLines {
-		lines = append(lines, dimStyle.Render(" ↓ more below"))
-	}
-
-	lines = append(lines, "")
-	if data.filter != "" {
-		lines = append(lines, dimStyle.Render(fmt.Sprintf("Filter: %s (%d models)", data.filter, len(filtered))))
-	}
-	lines = append(lines, dimStyle.Render("Enter to select • Esc to cancel • Tab to apply filter"))
-	lines = append(lines, "")
-	lines = append(lines, "Filter: "+data.filterInput.View())
-
-	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+	rows = append(rows, "", "Filter: "+data.filterInput.View())
+	return modePanel(m.width, strings.Join(rows, "\n"))
 }
 
 func (m Model) renderProfilesMode() string {
 	data := m.modeData.(*profilesMode)
-
-	var lines []string
-	lines = append(lines, titleStyle.Render("Select Profile"))
-	lines = append(lines, "")
-
-	for i, profile := range data.profiles {
-		prefix := "  "
-		if i == data.selected {
-			prefix = "→ "
-		}
-
-		profileName := profile.Name
-		if i == data.selected {
-			profileName = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Render(profileName)
-		} else {
-			profileName = dimStyle.Render(profileName)
-		}
-
-		lines = append(lines, prefix+profileName)
+	var rows []string
+	rows = append(rows, titleStyle.Render("Profiles"), dimStyle.Render("Enter select · n new · e edit · Esc cancel"), "")
+	if len(data.profiles) == 0 {
+		rows = append(rows, dimStyle.Render("No profiles"))
 	}
-
-	lines = append(lines, "")
-	lines = append(lines, dimStyle.Render("Enter to select • n new • Esc to cancel"))
-
-	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+	for i, p := range data.profiles {
+		prefix := "  "
+		style := dimStyle
+		if i == data.selected {
+			prefix = "› "
+			style = lipgloss.NewStyle().Foreground(accentColor).Bold(true)
+		}
+		rows = append(rows, prefix+style.Render(p.Name)+dimStyle.Render("  "+p.Model+" @ "+compactEndpoint(p.APIURL)))
+	}
+	return modePanel(m.width, strings.Join(rows, "\n"))
 }
 
 func (m Model) renderProfileFormMode() string {
 	data := m.modeData.(*profileFormMode)
-
-	var lines []string
-	lines = append(lines, titleStyle.Render(data.title))
-	lines = append(lines, "")
-	lines = append(lines, dimStyle.Render(data.help))
-	lines = append(lines, "")
-
+	var rows []string
+	rows = append(rows, titleStyle.Render(data.title), dimStyle.Render(data.help), "")
 	for i, label := range data.labels {
 		prefix := "  "
+		style := dimStyle
 		if i == data.selected {
-			prefix = "→ "
+			prefix = "› "
+			style = lipgloss.NewStyle().Foreground(accentColor).Bold(true)
 		}
-
-		input := data.inputs[i].View()
-		if i == data.selected {
-			input = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Render(input)
-		}
-
-		lines = append(lines, prefix+label+": "+input)
+		rows = append(rows, prefix+style.Render(label)+": "+data.inputs[i].View())
 	}
-
-	lines = append(lines, "")
-	lines = append(lines, dimStyle.Render("Enter to save • Tab to switch fields • Esc to cancel"))
-
-	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+	rows = append(rows, "", dimStyle.Render("Enter save · Tab next · Esc cancel"))
+	return modePanel(m.width, strings.Join(rows, "\n"))
 }
 
 func (m Model) renderTextInputMode() string {
 	data := m.modeData.(*textInputMode)
-
-	var lines []string
-	lines = append(lines, titleStyle.Render(data.title))
-	lines = append(lines, "")
-	lines = append(lines, dimStyle.Render(data.help))
-	lines = append(lines, "")
-	lines = append(lines, " "+data.input.View())
-	lines = append(lines, "")
-	lines = append(lines, dimStyle.Render("Enter to save • Esc to cancel"))
-
-	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+	body := lipgloss.JoinVertical(lipgloss.Left,
+		titleStyle.Render(data.title),
+		dimStyle.Render(data.help),
+		"",
+		data.input.View(),
+		"",
+		dimStyle.Render("Enter save · Esc cancel"),
+	)
+	return modePanel(m.width, body)
 }
 
 func (m Model) renderPermissionsMode() string {
 	data := m.modeData.(*permissionMode)
-
-	var lines []string
-	lines = append(lines, titleStyle.Render("Tool Approval Required"))
-	lines = append(lines, "")
-	lines = append(lines, dimStyle.Render("The assistant wants to run these tools:"))
-	lines = append(lines, "")
-
-	for i, toolCall := range data.toolCalls {
+	var rows []string
+	rows = append(rows, titleStyle.Render("Approve tools"), dimStyle.Render("Space toggle · a allow · r reject · Enter continue"), "")
+	for i, tc := range data.toolCalls {
 		prefix := "  "
 		if i == data.selected {
-			prefix = "→ "
+			prefix = "› "
 		}
-
-		toolInfo := fmt.Sprintf("%s(%s)", toolCall.Function.Name, truncate(toolCall.Function.Arguments, 50))
+		mark := lipgloss.NewStyle().Foreground(errorColor).Render("✗")
 		if data.approvals[i] {
-			toolInfo = toolStyle.Render("✓ ") + toolInfo
-		} else {
-			toolInfo = dimStyle.Render("✗ ") + toolInfo
+			mark = lipgloss.NewStyle().Foreground(successColor).Render("✓")
 		}
-
+		line := fmt.Sprintf("%s %s %s", prefix, mark, tc.Function.Name)
+		args := oneLine(tc.Function.Arguments, 70)
+		if args != "" {
+			line += dimStyle.Render("  " + args)
+		}
 		if i == data.selected {
-			toolInfo = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Render(toolInfo)
+			line = lipgloss.NewStyle().Foreground(accentColor).Bold(true).Render(line)
 		}
-
-		lines = append(lines, prefix+toolInfo)
+		rows = append(rows, line)
 	}
+	return modePanel(m.width, strings.Join(rows, "\n"))
+}
 
-	lines = append(lines, "")
-	lines = append(lines, dimStyle.Render("Space to toggle • Enter to confirm • Esc to cancel all"))
-
-	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+func modePanel(width int, body string) string {
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(panelColor).
+		Padding(1, 2).
+		Width(min(max(width-4, 44), 100)).
+		Render(body)
 }
 
 func (m Model) renderInput() string {
-	inputRendered := m.input.View()
-
-	styledInput := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(accentColor).
-		Padding(0, 1).
-		Width(m.width - 4).
-		Render(inputRendered)
-
-	return styledInput
-}
-
-func (m Model) renderFooter() string {
-	scrollHint := ""
-	if m.useViewport {
-		scrollHint = " • ↑/↓ scroll"
-	}
-
-	// Check if there are any messages with thinking content
-	hasThinking := false
-	for _, msg := range m.messages {
-		if strings.TrimSpace(msg.Thinking) != "" {
-			hasThinking = true
-			break
-		}
-	}
-
-	thinkingHint := ""
-	if hasThinking {
-		thinkingHint = " • ctrl+o toggle thinking"
-	}
-
-	var contextHint string
-	if m.contextUsed > 0 && m.contextLimit > 0 {
-		percent := float64(m.contextUsed) / float64(m.contextLimit) * 100
-		if percent > 80 {
-			contextHint = fmt.Sprintf(" • ctx %.0f%%", percent)
-		} else {
-			contextHint = fmt.Sprintf(" • ctx %.0f%%", percent)
-		}
-	}
-
-	hint := fmt.Sprintf(" Ctrl+C quit%s%s%s • %s • /help", scrollHint, thinkingHint, contextHint, m.working)
-	return "\n" + dimStyle.Render(hint)
+	width := max(m.width-2, 30)
+	return lipgloss.NewStyle().Width(width).Render(m.input.View())
 }
 
 func roleMeta(msg api.Message) (string, lipgloss.Color) {
 	switch msg.Role {
 	case "user":
-		return "You", lipgloss.Color("2")
+		return "You", userColor
 	case "assistant":
-		return "Cardinal", lipgloss.Color("5")
+		return "Cardinal", aiColor
 	case "tool":
-		return "Tool", lipgloss.Color("3")
+		return "Tool", toolColor
 	default:
-		return msg.Role, lipgloss.Color("8")
+		return msg.Role, dimColor
 	}
 }
 
 func compactEndpoint(endpoint string) string {
 	u, err := url.Parse(endpoint)
-	if err != nil {
+	if err != nil || u.Host == "" {
 		return endpoint
 	}
 	return u.Host
 }
 
-func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
+// looksLikeMarkdown is a cheap heuristic for whether a string is worth
+// running through glamour. We avoid rendering markdown for ordinary prompts;
+// only treat the message as markdown when it contains at least one of the
+// classic markers. Glamour is forgiving enough that the cost of a miss is
+// small (a few extra ANSI bytes), so we err slightly on the side of true.
+func looksLikeMarkdown(s string) bool {
+	if strings.Contains(s, "\n```") || strings.Contains(s, "```") {
+		return true
 	}
-	return s[:maxLen-3] + "..."
+	for _, marker := range []string{
+		"\n# ", "\n## ", "\n### ",
+		"\n- ", "\n* ", "\n1. ",
+		"\n> ",
+		"**", "__", "`",
+	} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func truncate(s string, maxLen int) string {
+	return oneLine(s, maxLen)
 }

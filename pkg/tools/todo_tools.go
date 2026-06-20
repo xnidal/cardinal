@@ -4,217 +4,138 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"cardinal/pkg/storage"
 )
 
-func (th *ToolHandler) executeTodoAdd(args string) ToolResult {
+func (th *ToolHandler) executeTodoWrite(args string) ToolResult {
 	var params struct {
-		Title       string `json:"title"`
-		Description string `json:"description,omitempty"`
-		Priority    string `json:"priority,omitempty"`
-		DueDate     string `json:"due_date,omitempty"`
-		Steps       []string `json:"steps,omitempty"`
+		// Top-level fields for the operation as a whole.
+		Action string `json:"action"` // "add", "update", "remove"
+		// Fields used by add.
+		Title string `json:"title,omitempty"`
+		// Fields used by update / remove.
+		ID     string `json:"id,omitempty"`
+		Status string `json:"status,omitempty"` // "pending", "in_progress", "completed"
 	}
 	if err := json.Unmarshal([]byte(args), &params); err != nil {
-		return ToolResult{Name: "todo_add", Success: false, Error: err.Error()}
+		return ToolResult{Name: "todo_write", Success: false, Error: err.Error()}
 	}
-	if strings.TrimSpace(params.Title) == "" {
-		return ToolResult{Name: "todo_add", Success: false, Error: "title is required"}
-	}
-	priority := storage.PriorityMedium
-	switch strings.ToLower(params.Priority) {
-	case "low":
-		priority = storage.PriorityLow
-	case "high":
-		priority = storage.PriorityHigh
-	case "medium":
-		priority = storage.PriorityMedium
-	}
-	var dueDate *time.Time
-	if params.DueDate != "" {
-		parsed, err := time.Parse("2006-01-02", params.DueDate)
+	switch strings.ToLower(strings.TrimSpace(params.Action)) {
+	case "add":
+		if strings.TrimSpace(params.Title) == "" {
+			return ToolResult{Name: "todo_write", Success: false, Error: "title is required"}
+		}
+		_, err := th.todos.Add(params.Title)
 		if err != nil {
-			return ToolResult{Name: "todo_add", Success: false, Error: "invalid due_date format, use YYYY-MM-DD"}
+			return ToolResult{Name: "todo_write", Success: false, Error: err.Error()}
 		}
-		dueDate = &parsed
-	}
-	item, err := storage.AddTodo(params.Title, params.Description, priority, dueDate)
-	if err != nil {
-		return ToolResult{Name: "todo_add", Success: false, Error: err.Error()}
-	}
-	// Add steps if provided
-	if len(params.Steps) > 0 {
-		var steps []storage.Step
-		for i, s := range params.Steps {
-			steps = append(steps, storage.Step{
-				ID:    fmt.Sprintf("step_%d", i+1),
-				Title: s,
-				Done:  false,
-			})
+		return ToolResult{Name: "todo_write", Success: true, Output: FormatTodoList(th.todos.List(""))}
+	case "update":
+		if strings.TrimSpace(params.ID) == "" {
+			return ToolResult{Name: "todo_write", Success: false, Error: "id is required"}
 		}
-		if updated, err := storage.SetTodoSteps(item.ID, steps); err == nil {
-			item = updated
+		var status *storage.TodoStatus
+		if params.Status != "" {
+			s := storage.TodoStatus(strings.ToLower(strings.TrimSpace(params.Status)))
+			switch s {
+			case storage.TodoPending, storage.TodoInProgress, storage.TodoCompleted:
+				status = &s
+			default:
+				return ToolResult{Name: "todo_write", Success: false, Error: "status must be pending, in_progress, or completed"}
+			}
 		}
+		// Also allow updating the title (handy, no extra tool needed).
+		var titlePtr *string
+		if params.Title != "" {
+			t := params.Title
+			titlePtr = &t
+		}
+		if _, err := th.todos.Update(params.ID, status, titlePtr); err != nil {
+			return ToolResult{Name: "todo_write", Success: false, Error: err.Error()}
+		}
+		return ToolResult{Name: "todo_write", Success: true, Output: FormatTodoList(th.todos.List(""))}
+	case "remove":
+		if strings.TrimSpace(params.ID) == "" {
+			return ToolResult{Name: "todo_write", Success: false, Error: "id is required"}
+		}
+		if err := th.todos.Remove(params.ID); err != nil {
+			return ToolResult{Name: "todo_write", Success: false, Error: err.Error()}
+		}
+		return ToolResult{Name: "todo_write", Success: true, Output: FormatTodoList(th.todos.List(""))}
+	default:
+		return ToolResult{Name: "todo_write", Success: false, Error: "action must be add, update, or remove"}
 	}
-	return ToolResult{Name: "todo_add", Success: true, Output: formatTodoItem(item)}
 }
 
-func (th *ToolHandler) executeTodoList(args string) ToolResult {
+func (th *ToolHandler) executeTodoRead(args string) ToolResult {
 	var params struct {
 		Status string `json:"status,omitempty"`
 	}
-	if err := json.Unmarshal([]byte(args), &params); err != nil {
-		return ToolResult{Name: "todo_list", Success: false, Error: err.Error()}
-	}
-	list, err := storage.LoadTodos()
-	if err != nil {
-		return ToolResult{Name: "todo_list", Success: false, Error: err.Error()}
-	}
-	var filtered []storage.TodoItem
-	for _, item := range list.Items {
-		if params.Status == "" {
-			filtered = append(filtered, item)
-		} else {
-			status := strings.ToLower(params.Status)
-			if strings.ToLower(string(item.Status)) == status {
-				filtered = append(filtered, item)
-			}
+	// Allow empty args.
+	if strings.TrimSpace(args) != "" {
+		if err := json.Unmarshal([]byte(args), &params); err != nil {
+			return ToolResult{Name: "todo_read", Success: false, Error: err.Error()}
 		}
 	}
-	if len(filtered) == 0 {
-		return ToolResult{Name: "todo_list", Success: true, Output: "No todo items found"}
-	}
-	var output strings.Builder
-	for _, item := range filtered {
-		output.WriteString(formatTodoItem(&item) + "\n")
-	}
-	return ToolResult{Name: "todo_list", Success: true, Output: strings.TrimSpace(output.String())}
-}
-
-func (th *ToolHandler) executeTodoUpdate(args string) ToolResult {
-	var params struct {
-		ID       string `json:"id"`
-		Status   string `json:"status,omitempty"`
-		Priority string `json:"priority,omitempty"`
-		DueDate  string `json:"due_date,omitempty"`
-	}
-	if err := json.Unmarshal([]byte(args), &params); err != nil {
-		return ToolResult{Name: "todo_update", Success: false, Error: err.Error()}
-	}
-	if strings.TrimSpace(params.ID) == "" {
-		return ToolResult{Name: "todo_update", Success: false, Error: "id is required"}
-	}
-	var status *storage.TodoStatus
-	if params.Status != "" {
-		s := storage.TodoStatus(strings.ToLower(params.Status))
-		switch s {
-		case storage.TodoPending, storage.TodoInProgress, storage.TodoCompleted:
-			status = &s
+	statusFilter := strings.ToLower(strings.TrimSpace(params.Status))
+	if statusFilter != "" {
+		switch statusFilter {
+		case string(storage.TodoPending), string(storage.TodoInProgress), string(storage.TodoCompleted):
 		default:
-			return ToolResult{Name: "todo_update", Success: false, Error: "invalid status, use: pending, in_progress, or completed"}
+			return ToolResult{Name: "todo_read", Success: false, Error: "status filter must be pending, in_progress, or completed"}
 		}
 	}
-	var priority *storage.TodoPriority
-	if params.Priority != "" {
-		p := storage.TodoPriority(strings.ToLower(params.Priority))
-		switch p {
-		case storage.PriorityLow, storage.PriorityMedium, storage.PriorityHigh:
-			priority = &p
-		default:
-			return ToolResult{Name: "todo_update", Success: false, Error: "invalid priority, use: low, medium, or high"}
+	items := th.todos.List(statusFilter)
+	if len(items) == 0 {
+		if statusFilter == "" {
+			return ToolResult{Name: "todo_read", Success: true, Output: "No todos yet."}
 		}
+		return ToolResult{Name: "todo_read", Success: true, Output: "No " + statusFilter + " todos."}
 	}
-	var dueDate *time.Time
-	if params.DueDate != "" {
-		parsed, err := time.Parse("2006-01-02", params.DueDate)
-		if err != nil {
-			return ToolResult{Name: "todo_update", Success: false, Error: "invalid due_date format, use YYYY-MM-DD"}
-		}
-		dueDate = &parsed
-	}
-	item, err := storage.UpdateTodo(params.ID, status, priority, dueDate)
-	if err != nil {
-		return ToolResult{Name: "todo_update", Success: false, Error: err.Error()}
-	}
-	return ToolResult{Name: "todo_update", Success: true, Output: formatTodoItem(item)}
+	return ToolResult{Name: "todo_read", Success: true, Output: FormatTodoList(items)}
 }
 
-func (th *ToolHandler) executeTodoRemove(args string) ToolResult {
-	var params struct {
-		ID string `json:"id"`
+// FormatTodoList renders a todo list in a plain, human-friendly checklist.
+// Each item occupies one line. Completed items are wrapped in strikethrough
+// markers so the terminal/renderer can style them if it wishes; otherwise
+// they read as natural prose. Exposed so other packages (e.g. the todo
+// verifier) can render the same snapshot the model sees.
+func FormatTodoList(items []storage.TodoItem) string {
+	if len(items) == 0 {
+		return "No todos yet."
 	}
-	if err := json.Unmarshal([]byte(args), &params); err != nil {
-		return ToolResult{Name: "todo_remove", Success: false, Error: err.Error()}
-	}
-	if strings.TrimSpace(params.ID) == "" {
-		return ToolResult{Name: "todo_remove", Success: false, Error: "id is required"}
-	}
-	if err := storage.RemoveTodo(params.ID); err != nil {
-		return ToolResult{Name: "todo_remove", Success: false, Error: err.Error()}
-	}
-	return ToolResult{Name: "todo_remove", Success: true, Output: "Removed todo item: " + params.ID}
-}
-
-func (th *ToolHandler) executeTodoSetProgress(args string) ToolResult {
-	var params struct {
-		ID       string `json:"id"`
-		Progress int    `json:"progress"`
-	}
-	if err := json.Unmarshal([]byte(args), &params); err != nil {
-		return ToolResult{Name: "todo_set_progress", Success: false, Error: err.Error()}
-	}
-	if strings.TrimSpace(params.ID) == "" {
-		return ToolResult{Name: "todo_set_progress", Success: false, Error: "id is required"}
-	}
-	item, err := storage.SetTodoProgress(params.ID, params.Progress)
-	if err != nil {
-		return ToolResult{Name: "todo_set_progress", Success: false, Error: err.Error()}
-	}
-	return ToolResult{Name: "todo_set_progress", Success: true, Output: formatTodoItem(item)}
-}
-
-func (th *ToolHandler) executeTodoToggleStep(args string) ToolResult {
-	var params struct {
-		TodoID string `json:"todo_id"`
-		StepID string `json:"step_id"`
-	}
-	if err := json.Unmarshal([]byte(args), &params); err != nil {
-		return ToolResult{Name: "todo_toggle_step", Success: false, Error: err.Error()}
-	}
-	if strings.TrimSpace(params.TodoID) == "" || strings.TrimSpace(params.StepID) == "" {
-		return ToolResult{Name: "todo_toggle_step", Success: false, Error: "todo_id and step_id are required"}
-	}
-	item, err := storage.ToggleStep(params.TodoID, params.StepID)
-	if err != nil {
-		return ToolResult{Name: "todo_toggle_step", Success: false, Error: err.Error()}
-	}
-	return ToolResult{Name: "todo_toggle_step", Success: true, Output: formatTodoItem(item)}
-}
-
-func formatTodoItem(item *storage.TodoItem) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("[%s] %s", item.ID, item.Title))
-	if item.Description != "" {
-		sb.WriteString(fmt.Sprintf(" - %s", item.Description))
-	}
-	sb.WriteString(fmt.Sprintf(" (%s, %s", item.Priority, item.Status))
-	if item.Progress > 0 {
-		sb.WriteString(fmt.Sprintf(", %d%%", item.Progress))
-	}
-	sb.WriteString(")")
-	if item.DueDate != nil {
-		sb.WriteString(fmt.Sprintf(" due:%s", item.DueDate.Format("2006-01-02")))
-	}
-	for _, step := range item.Steps {
-		check := " "
-		if step.Done {
-			check = "x"
+	for _, item := range items {
+		mark := "☐"
+		switch item.Status {
+		case storage.TodoInProgress:
+			mark = "◐"
+		case storage.TodoCompleted:
+			mark = "☑"
 		}
-		sb.WriteString(fmt.Sprintf("\n  [%s] %s: %s", check, step.ID, step.Title))
+		title := item.Title
+		idSuffix := "  #" + shortID(item.ID)
+		switch item.Status {
+		case storage.TodoCompleted:
+			sb.WriteString(fmt.Sprintf("%s ~~%s~~%s\n", mark, title, idSuffix))
+		case storage.TodoInProgress:
+			sb.WriteString(fmt.Sprintf("%s %s (in progress)%s\n", mark, title, idSuffix))
+		default:
+			sb.WriteString(fmt.Sprintf("%s %s%s\n", mark, title, idSuffix))
+		}
 	}
-	return sb.String()
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// shortID returns the trailing portion of a todo id so the rendered checklist
+// stays compact. Real ids look like "20260120123456-abcd" — keeping just the
+// random tail is plenty for a model to disambiguate.
+func shortID(id string) string {
+	if i := strings.LastIndex(id, "-"); i >= 0 && i < len(id)-1 {
+		return id[i+1:]
+	}
+	return id
 }
 
 func getTodoToolDefinitions() []any {
@@ -222,92 +143,48 @@ func getTodoToolDefinitions() []any {
 		map[string]any{
 			"type": "function",
 			"function": map[string]any{
-				"name":        "todo_add",
-				"description": "Add a new todo item to track a task step",
+				"name":        "todo_write",
+				"description": "Manage the session todo list. Use action=add with a title to create a todo, action=update with id and status (or a new title) to change one, or action=remove with id to delete it. Always returns the current todo list.",
 				"parameters": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"title":       map[string]any{"type": "string", "description": "The title of the todo item"},
-						"description": map[string]any{"type": "string", "description": "Optional description of the todo item"},
-						"priority":    map[string]any{"type": "string", "description": "Priority level: low, medium, or high (default: medium)"},
-						"due_date":    map[string]any{"type": "string", "description": "Due date in YYYY-MM-DD format"},
-						"steps":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional list of subtask titles"},
+						"action": map[string]any{
+							"type":        "string",
+							"enum":        []string{"add", "update", "remove"},
+							"description": "What to do: add creates a new todo, update changes status or title of an existing one, remove deletes it.",
+						},
+						"title": map[string]any{
+							"type":        "string",
+							"description": "For action=add: the todo text. For action=update: an optional new title.",
+						},
+						"id": map[string]any{
+							"type":        "string",
+							"description": "The short id shown in the list (e.g. 'ab12'). Required for update and remove.",
+						},
+						"status": map[string]any{
+							"type":        "string",
+							"enum":        []string{"pending", "in_progress", "completed"},
+							"description": "New status. Only used with action=update.",
+						},
 					},
-					"required": []string{"title"},
+					"required": []string{"action"},
 				},
 			},
 		},
 		map[string]any{
 			"type": "function",
 			"function": map[string]any{
-				"name":        "todo_list",
-				"description": "List all todo items, optionally filtered by status",
+				"name":        "todo_read",
+				"description": "Show the current todo list. Optionally filter by status (pending, in_progress, completed).",
 				"parameters": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"status": map[string]any{"type": "string", "description": "Filter by status: pending, in_progress, or completed"},
+						"status": map[string]any{
+							"type":        "string",
+							"enum":        []string{"pending", "in_progress", "completed"},
+							"description": "Optional filter: only show todos with this status.",
+						},
 					},
-				},
-			},
-		},
-		map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name":        "todo_update",
-				"description": "Update a todo item status, priority, or due date",
-				"parameters": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"id":       map[string]any{"type": "string", "description": "The ID of the todo item"},
-						"status":   map[string]any{"type": "string", "description": "New status: pending, in_progress, or completed"},
-						"priority": map[string]any{"type": "string", "description": "New priority: low, medium, or high"},
-						"due_date": map[string]any{"type": "string", "description": "New due date in YYYY-MM-DD format"},
-					},
-					"required": []string{"id"},
-				},
-			},
-		},
-		map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name":        "todo_remove",
-				"description": "Remove a todo item from the list",
-				"parameters": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"id": map[string]any{"type": "string", "description": "The ID of the todo item to remove"},
-					},
-					"required": []string{"id"},
-				},
-			},
-		},
-		map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name":        "todo_set_progress",
-				"description": "Set the progress percentage (0-100) of a todo item",
-				"parameters": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"id":       map[string]any{"type": "string", "description": "The ID of the todo item"},
-						"progress": map[string]any{"type": "integer", "description": "Progress percentage (0-100)"},
-					},
-					"required": []string{"id", "progress"},
-				},
-			},
-		},
-		map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name":        "todo_toggle_step",
-				"description": "Toggle the done state of a step/subtask within a todo item",
-				"parameters": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"todo_id": map[string]any{"type": "string", "description": "The ID of the parent todo item"},
-						"step_id": map[string]any{"type": "string", "description": "The ID of the step to toggle"},
-					},
-					"required": []string{"todo_id", "step_id"},
 				},
 			},
 		},
@@ -316,40 +193,44 @@ func getTodoToolDefinitions() []any {
 
 func summarizeTodoCall(name, args string) string {
 	switch name {
-	case "todo_add":
+	case "todo_write":
 		var params struct {
-			Title string `json:"title"`
-		}
-		if err := json.Unmarshal([]byte(args), &params); err == nil && params.Title != "" {
-			return "todo: add '" + truncate(params.Title, 40) + "'"
-		}
-	case "todo_list":
-		return "todo: list items"
-	case "todo_update":
-		var params struct {
-			ID     string `json:"id"`
+			Action string `json:"action"`
+			Title  string `json:"title,omitempty"`
+			ID     string `json:"id,omitempty"`
 			Status string `json:"status,omitempty"`
 		}
-		if err := json.Unmarshal([]byte(args), &params); err == nil && params.ID != "" {
-			return "todo: update " + params.ID + " -> " + params.Status
+		if err := json.Unmarshal([]byte(args), &params); err != nil {
+			return "todo"
 		}
-	case "todo_remove":
-		var params struct {
-			ID string `json:"id"`
-		}
-		if err := json.Unmarshal([]byte(args), &params); err == nil && params.ID != "" {
+		switch params.Action {
+		case "add":
+			if params.Title != "" {
+				return "todo: add '" + truncate(params.Title, 40) + "'"
+			}
+			return "todo: add"
+		case "update":
+			bits := "todo: update " + params.ID
+			if params.Status != "" {
+				bits += " → " + params.Status
+			}
+			if params.Title != "" {
+				bits += " (rename)"
+			}
+			return bits
+		case "remove":
 			return "todo: remove " + params.ID
 		}
-	case "todo_set_progress":
-		var params struct {
-			ID       string `json:"id"`
-			Progress int    `json:"progress"`
-		}
-		if err := json.Unmarshal([]byte(args), &params); err == nil {
-			return fmt.Sprintf("todo: %s progress %d%%", params.ID, params.Progress)
-		}
-	case "todo_toggle_step":
-		return "todo: toggle step"
+		return "todo"
+	case "todo_read":
+		return "todo: list"
+	}
+	// Backward-compat summary lines for any leftover callers.
+	switch name {
+	case "todo_add", "todo_list", "todo_update", "todo_remove", "todo_set_progress", "todo_toggle_step":
+		return "todo"
 	}
 	return ""
 }
+
+

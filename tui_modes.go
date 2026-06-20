@@ -53,9 +53,122 @@ func (m Model) handleSlashCommand(cmd string) (tea.Model, tea.Cmd) {
 	m.suggestions = nil
 	m.err = nil
 
-	switch cmd {
+	fields := strings.Fields(cmd)
+	base := cmd
+	arg := ""
+	if len(fields) > 0 {
+		base = fields[0]
+		if len(fields) > 1 {
+			arg = strings.TrimSpace(strings.TrimPrefix(cmd, base))
+		}
+	}
+
+	// Commands safe to run while the model is streaming. They touch only local
+	// state and emit a TUI-only system note (never sent to the LLM).
+	switch base {
+	case "/thinking":
+		m.showThinking = !m.showThinking
+		state := "shown"
+		if !m.showThinking {
+			state = "hidden"
+		}
+		m.addSystemNote(fmt.Sprintf("Thinking blocks %s", state))
+		return m, nil
+
+	case "/autoapprove":
+		m.autoApprove = !m.autoApprove
+		state := "disabled"
+		if m.autoApprove {
+			state = "enabled"
+		}
+		m.addSystemNote(fmt.Sprintf("Auto-approve tool calls %s", state))
+		return m, nil
+
+	case "/model":
+		if arg == "" {
+			m.err = fmt.Errorf("usage: /model <id>")
+			return m, nil
+		}
+		m.cfg.SetModel(arg)
+		m.addSystemNote(fmt.Sprintf("Model set to %s", arg))
+		m.status = "Updated model"
+		return m, nil
+
+	case "/profile":
+		switch {
+		case arg == "":
+			m = m.openProfilesMode()
+			return m, nil
+		case arg == "new":
+			m = m.openProfileForm(config.Profile{APIURL: m.cfg.APIURL, APIKey: m.cfg.APIKey, Model: m.cfg.Model}, false)
+			return m, nil
+		case arg == "edit":
+			active := config.Profile{Name: m.cfg.ActiveProfileName(), APIURL: m.cfg.APIURL, APIKey: m.cfg.APIKey, Model: m.cfg.Model}
+			if profiles := m.cfg.ListProfiles(); len(profiles) > 0 {
+				for _, p := range profiles {
+					if p.Name == m.cfg.ActiveProfileName() {
+						active = p
+						break
+					}
+				}
+			}
+			m = m.openProfileForm(active, true)
+			return m, nil
+		default:
+			if err := m.cfg.SwitchProfile(arg); err != nil {
+				m.err = err
+				return m, nil
+			}
+			m.client = api.NewClient(m.cfg.APIURL, m.cfg.APIKey)
+			m.addSystemNote(fmt.Sprintf("Active profile set to %s", m.cfg.ActiveProfileName()))
+			m.status = "Updated profile"
+			return m, nil
+		}
+	}
+
+	// Mode-opening commands cannot run while a request is in flight because they
+	// grab the input focus. Surface a TUI note instead.
+	if m.busy {
+		switch base {
+		case "/goal":
+			m.addSystemNote("/goal requires the model to be idle — wait or press Esc to cancel")
+			return m, nil
+		case "/clear", "/new":
+			m.addSystemNote("/clear requires the model to be idle — wait or press Esc to cancel")
+			return m, nil
+		case "/undo":
+			m.addSystemNote("/undo requires the model to be idle — wait or press Esc to cancel")
+			return m, nil
+		case "/profile":
+			m.addSystemNote("/profile requires the model to be idle — wait or press Esc to cancel")
+			return m, nil
+		case "/models", "/profiles", "/endpoint", "/apikey", "/help", "/tools":
+			m.addSystemNote(base + " requires the model to be idle — wait or press Esc to cancel")
+			return m, nil
+		}
+		m.addSystemNote(fmt.Sprintf("Cannot run %s while a request is in flight", base))
+		return m, nil
+	}
+
+	switch base {
+	case "/goal":
+		if arg == "" {
+			m.err = fmt.Errorf("usage: /goal <task>")
+			return m, nil
+		}
+		m.goalMode = true
+		m.goalText = arg
+		m.completionChecks = 0
+		m.messages = append(m.messages, api.Message{Role: "user", Content: arg})
+		m.lastMessages = append([]api.Message(nil), m.messages...)
+		m.promptHistory = append(m.promptHistory, cmd)
+		m.historyIndex = len(m.promptHistory)
+		m.status = "Goal seeking"
+		return m.beginStream()
+
 	case "/clear", "/new":
 		m.messages = nil
+		m.systemNotes = nil
 		m.streaming = ""
 		m.pendingToolCalls = nil
 		m.err = nil
@@ -68,23 +181,27 @@ func (m Model) handleSlashCommand(cmd string) (tea.Model, tea.Cmd) {
 		return m.undoLastMessage()
 
 	case "/help":
-	help := `Available commands:
-/clear - Clear chat history
-/undo - Undo last message pair (user + assistant)
-/models - Choose a model from the active profile endpoint
-/profiles - Switch or edit saved profiles
-/profile new - Create and activate a new profile
-/profile edit - Edit the active profile
-/endpoint - Update the active profile endpoint
-/apikey - Update the active profile API key
-/tools - List available tools
-/autoapprove - Toggle auto-approve all tool calls
-/help - Show this help
+		help := `Commands:
+/goal <task>         keep working until verifier passes
+/clear, /new         clear chat
+/undo                remove last user turn
+/thinking            toggle thinking visibility going forward
+/autoapprove         toggle all tool prompts
+/model <id>          set active model
+/profile <name>      switch profile (no arg opens browser)
+/profile new|edit    create or edit a profile
+/profiles            browse profiles
+/endpoint            edit active endpoint
+/apikey              edit active API key
+/models              browse and set models
+/tools               list tools
+/help                show this help
 
-Keyboard shortcuts:
-Ctrl+O - Toggle thinking content visibility
-Ctrl+C - Quit
-Esc - Cancel current request`
+While the model runs, only toggles (e.g. /thinking, /autoapprove) and
+/profile <name>, /model <id> can be applied.
+
+Keys:
+Enter send · Esc cancel request/mode · Ctrl+C quit`
 		m.messages = append(m.messages, api.Message{Role: "assistant", Content: help})
 		m.status = "Ready"
 		return m, nil
@@ -94,16 +211,8 @@ Esc - Cancel current request`
 		m.status = "Loading models"
 		return m, m.fetchModels()
 
-	case "/profiles", "/profile":
+	case "/profiles":
 		m = m.openProfilesMode()
-		return m, nil
-
-	case "/profile new":
-		m = m.openProfileForm(config.Profile{APIURL: m.cfg.APIURL, APIKey: m.cfg.APIKey, Model: m.cfg.Model}, false)
-		return m, nil
-
-	case "/profile edit":
-		m = m.openProfileForm(config.Profile{Name: m.cfg.ActiveProfileName(), APIURL: m.cfg.APIURL, APIKey: m.cfg.APIKey, Model: m.cfg.Model}, true)
 		return m, nil
 
 	case "/endpoint":
@@ -118,21 +227,8 @@ Esc - Cancel current request`
 		m.resize(m.width, m.height)
 		return m, nil
 
-	case "/autoapprove":
-		m.autoApprove = !m.autoApprove
-		status := "disabled"
-		if m.autoApprove {
-			status = "enabled"
-		}
-		m.messages = append(m.messages, api.Message{
-			Role:    "assistant",
-			Content: fmt.Sprintf("Auto-approve tool calls %s. All tool calls will be executed without prompting.", status),
-		})
-		m.status = "Ready"
-		return m, nil
-
 	case "/tools":
-		toolList := "Available tools:\n• bash - Execute bash commands\n• read_file - Read file contents\n• write_file - Write/create files\n• edit_file - Find & replace in files\n• list_files - List directory contents\n• grep - Search file contents\n• glob - Find files by pattern\n• file_info - Get file metadata\n• calculate - Evaluate math expressions\n• edit_soul - Edit agent's SOUL.md\n• subagent - Launch sub-agent tasks\n• todo_add/list/update/remove - Task management"
+		toolList := "Available tools:\n• bash - Execute bash commands\n• read_file - Read file contents\n• write_file - Write/create files\n• edit_file - Find & replace in files\n• list_files - List directory contents\n• grep - Search file contents\n• glob - Find files by pattern\n• file_info - Get file metadata\n• calculate - Evaluate math expressions\n• edit_soul - Edit agent's SOUL.md\n• subagent - Launch sub-agent tasks\n• todo_write/read - Task management"
 		m.messages = append(m.messages, api.Message{Role: "assistant", Content: toolList})
 		m.status = "Ready"
 		return m, nil
@@ -223,6 +319,8 @@ func (m Model) openProfileForm(profile config.Profile, editing bool) Model {
 
 func (m Model) updateModelsMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 	data := m.modeData.(*modelsMode)
+	data.filter = strings.TrimSpace(data.filterInput.Value())
+	clampModelsMode(data)
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -233,9 +331,6 @@ func (m Model) updateModelsMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case tea.KeyTab:
-			data.filter = strings.TrimSpace(data.filterInput.Value())
-			data.selected = 0
-			data.scroll = 0
 			return m, nil
 
 		case tea.KeyUp:
@@ -302,17 +397,40 @@ func (m Model) updateModelsMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	data.filterInput, cmd = data.filterInput.Update(msg)
 	data.filter = strings.TrimSpace(data.filterInput.Value())
-
-	// Clamp selected within filtered list
-	filtered := filterModels(data.models, data.filter)
-	if len(filtered) > 0 && data.selected >= len(filtered) {
-		data.selected = len(filtered) - 1
-		if data.selected < 0 {
-			data.selected = 0
-		}
-	}
+	clampModelsMode(data)
 
 	return m, cmd
+}
+
+func clampModelsMode(data *modelsMode) {
+	filtered := filterModels(data.models, data.filter)
+	if data.visibleLines <= 0 {
+		data.visibleLines = 8
+	}
+	if len(filtered) == 0 {
+		data.selected = 0
+		data.scroll = 0
+		return
+	}
+	if data.selected < 0 {
+		data.selected = 0
+	}
+	if data.selected >= len(filtered) {
+		data.selected = len(filtered) - 1
+	}
+	maxScroll := max(0, len(filtered)-data.visibleLines)
+	if data.scroll > maxScroll {
+		data.scroll = maxScroll
+	}
+	if data.scroll < 0 {
+		data.scroll = 0
+	}
+	if data.selected < data.scroll {
+		data.scroll = data.selected
+	}
+	if data.selected >= data.scroll+data.visibleLines {
+		data.scroll = data.selected - data.visibleLines + 1
+	}
 }
 
 func filterModels(models []api.Model, filter string) []api.Model {
@@ -478,15 +596,23 @@ func (m Model) updateTextInputMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) updatePermissionsMode(msg tea.Msg) (tea.Model, tea.Cmd) {
-	data := m.modeData.(*permissionMode)
+	data, ok := m.modeData.(*permissionMode)
+	if !ok {
+		return m, nil
+	}
+	return m.applyInlineApproval(data, msg)
+}
 
+// applyInlineApproval processes keys for the inline approval card. It
+// intentionally does not touch the input textarea so the prompt remains
+// visually stable below the card.
+func (m Model) applyInlineApproval(data *permissionMode, msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.Type {
 		case tea.KeyEscape, tea.KeyCtrlC:
 			approvals := make([]bool, len(data.toolCalls))
-			m.mode = ""
-			m.modeData = nil
+			m.pendingApproval = nil
 			m.busy = true
 			m.status = "Continuing without tool execution"
 			return m, m.executeToolPlanCmd(data.assistantContent, data.thinkingContent, data.toolCalls, approvals)
@@ -511,16 +637,15 @@ func (m Model) updatePermissionsMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case tea.KeyEnter:
 			approvals := append([]bool(nil), data.approvals...)
-			m.mode = ""
-			m.modeData = nil
+			m.pendingApproval = nil
 			m.busy = true
-		if approvedToolCount(approvals) == 0 {
-			m.status = "Continuing without tool execution"
-		} else if approvedToolCount(approvals) > 1 {
-			m.status = fmt.Sprintf("Running %d tools in parallel", approvedToolCount(approvals))
-		} else {
-			m.status = "Running tool"
-		}
+			if approvedToolCount(approvals) == 0 {
+				m.status = "Continuing without tool execution"
+			} else if approvedToolCount(approvals) > 1 {
+				m.status = fmt.Sprintf("Running %d tools in parallel", approvedToolCount(approvals))
+			} else {
+				m.status = "Running tool"
+			}
 			return m, m.executeToolPlanCmd(data.assistantContent, data.thinkingContent, data.toolCalls, approvals)
 		}
 
@@ -550,7 +675,6 @@ func (m Model) updatePermissionsMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	}
-
 	return m, nil
 }
 
@@ -625,7 +749,7 @@ func newPermissionMode(assistantContent, thinkingContent string, toolCalls []api
 	return &permissionMode{
 		assistantContent: assistantContent,
 		thinkingContent:  thinkingContent,
-		toolCalls: append([]api.ToolCall(nil), toolCalls...),
-		approvals: defaultToolApprovals(toolCalls),
+		toolCalls:        append([]api.ToolCall(nil), toolCalls...),
+		approvals:        defaultToolApprovals(toolCalls),
 	}
 }

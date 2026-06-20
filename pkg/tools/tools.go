@@ -18,12 +18,13 @@ import (
 )
 
 type ToolResult struct {
-	Name    string `json:"name"`
-	Success bool   `json:"success"`
-	Output  string `json:"output"`
-	Error   string `json:"error,omitempty"`
-	Path    string `json:"path,omitempty"`
-	Lines   string `json:"lines,omitempty"`
+	Name    string       `json:"name"`
+	Success bool         `json:"success"`
+	Output  string       `json:"output"`
+	Error   string       `json:"error,omitempty"`
+	Path    string       `json:"path,omitempty"`
+	Lines   string       `json:"lines,omitempty"`
+	Data    []ToolResult `json:"data,omitempty"`
 }
 
 type ToolCall struct {
@@ -35,18 +36,27 @@ type ToolHandler struct {
 	workingDir string
 	tools      map[string]func(string) ToolResult
 	onEditSoul func()
+	todos      *storage.TodoStore
 }
 
 func NewToolHandler(workingDir string, onEditSoul func()) *ToolHandler {
+	return NewToolHandlerWithTodos(workingDir, onEditSoul, storage.NewTodoStore())
+}
+
+// NewToolHandlerWithTodos lets callers share a todo store across the whole
+// session. Each session should construct exactly one TodoStore; the store is
+// in-memory only and intentionally drops on process exit.
+func NewToolHandlerWithTodos(workingDir string, onEditSoul func(), todos *storage.TodoStore) *ToolHandler {
 	th := &ToolHandler{
 		workingDir: workingDir,
 		tools:      make(map[string]func(string) ToolResult),
 		onEditSoul: onEditSoul,
+		todos:      todos,
 	}
 
 	th.tools["bash"] = th.executeBash
 	th.tools["list_files"] = th.executeListFiles
-	th.tools["read_file"] = th.executeReadFile
+	th.tools["read_files"] = th.executeReadFiles
 	th.tools["write_file"] = th.executeWriteFile
 	th.tools["edit_file"] = th.executeEditFile
 	th.tools["grep"] = th.executeGrep
@@ -54,18 +64,25 @@ func NewToolHandler(workingDir string, onEditSoul func()) *ToolHandler {
 	th.tools["file_info"] = th.executeFileInfo
 	th.tools["edit_soul"] = th.executeEditSoul
 	th.tools["calculate"] = th.executeCalculate
-	th.tools["todo_add"] = th.executeTodoAdd
-	th.tools["todo_list"] = th.executeTodoList
-	th.tools["todo_update"] = th.executeTodoUpdate
-	th.tools["todo_remove"] = th.executeTodoRemove
-	th.tools["todo_set_progress"] = th.executeTodoSetProgress
-	th.tools["todo_toggle_step"] = th.executeTodoToggleStep
+	th.tools["todo_write"] = th.executeTodoWrite
+	th.tools["todo_read"] = th.executeTodoRead
 	th.tools["subagent"] = th.executeSubAgent
 	th.tools["subagent_status"] = th.executeSubAgentStatus
 	th.tools["subagent_list"] = th.executeSubAgentList
 	th.tools["subagent_clear"] = th.executeSubAgentClear
 
 	return th
+}
+
+func KnownTool(name string) bool {
+	switch name {
+	case "bash", "list_files", "read_files", "write_file", "edit_file", "grep", "glob", "file_info", "edit_soul", "calculate",
+		"todo_write", "todo_read",
+		"subagent", "subagent_status", "subagent_list", "subagent_clear":
+		return true
+	default:
+		return false
+	}
 }
 
 func (th *ToolHandler) Execute(call ToolCall) ToolResult {
@@ -82,7 +99,9 @@ func (th *ToolHandler) Execute(call ToolCall) ToolResult {
 
 func RequiresApproval(name string) bool {
 	switch name {
-	case "list_files", "read_file", "grep", "glob", "file_info", "edit_soul", "calculate", "todo_list", "todo_set_progress", "todo_toggle_step", "subagent", "subagent_status", "subagent_list", "subagent_clear":
+	case "list_files", "read_files", "grep", "glob", "file_info", "edit_soul", "calculate",
+		"todo_write", "todo_read",
+		"subagent", "subagent_status", "subagent_list", "subagent_clear":
 		return false
 	default:
 		return true
@@ -112,22 +131,25 @@ func SummarizeCall(name, args string) string {
 		if err := json.Unmarshal([]byte(args), &params); err == nil && strings.TrimSpace(params.Expression) != "" {
 			return "= " + params.Expression
 		}
-	case "read_file":
+	case "read_files":
 		var params struct {
-			Path   string `json:"path"`
-			Offset int    `json:"offset,omitempty"`
-			Limit  int    `json:"limit,omitempty"`
+			Paths  []string `json:"paths"`
+			Offset int      `json:"offset,omitempty"`
+			Limit  int      `json:"limit,omitempty"`
 		}
-		if err := json.Unmarshal([]byte(args), &params); err == nil && strings.TrimSpace(params.Path) != "" {
-			result := "read: " + params.Path
-			if params.Offset > 0 || params.Limit > 0 {
-				result += fmt.Sprintf(" (line %d", params.Offset+1)
-				if params.Limit > 0 {
-					result += fmt.Sprintf(", %d lines", params.Limit)
+		if err := json.Unmarshal([]byte(args), &params); err == nil && len(params.Paths) > 0 {
+			if len(params.Paths) == 1 {
+				r := "read: " + params.Paths[0]
+				if params.Offset > 0 || params.Limit > 0 {
+					r += fmt.Sprintf(" (line %d", params.Offset+1)
+					if params.Limit > 0 {
+						r += fmt.Sprintf(", %d lines", params.Limit)
+					}
+					r += ")"
 				}
-				result += ")"
+				return r
 			}
-			return result
+			return fmt.Sprintf("read_files (%d)", len(params.Paths))
 		}
 	case "write_file":
 		var params struct {
@@ -278,61 +300,162 @@ func (th *ToolHandler) executeListFiles(args string) ToolResult {
 	return ToolResult{Name: "list_files", Success: true, Output: strings.Join(files, "\n"), Path: displayPath}
 }
 
-func (th *ToolHandler) executeReadFile(args string) ToolResult {
+func (th *ToolHandler) executeReadFiles(args string) ToolResult {
 	var params struct {
-		Path   string `json:"path"`
-		Offset int    `json:"offset,omitempty"`
-		Limit  int    `json:"limit,omitempty"`
+		Paths  []string `json:"paths"`
+		Offset int      `json:"offset,omitempty"`
+		Limit  int      `json:"limit,omitempty"`
 	}
-
 	if err := json.Unmarshal([]byte(args), &params); err != nil {
-		return ToolResult{Name: "read_file", Success: false, Error: err.Error()}
+		return ToolResult{Name: "read_files", Success: false, Error: err.Error()}
 	}
-
-	if strings.TrimSpace(params.Path) == "" {
-		return ToolResult{Name: "read_file", Success: false, Error: "no file path provided"}
+	if len(params.Paths) == 0 {
+		return ToolResult{Name: "read_files", Success: false, Error: "paths is required"}
 	}
-
-	fullPath, err := th.resolvePath(params.Path)
-	if err != nil {
-		return ToolResult{Name: "read_file", Success: false, Error: err.Error()}
+	const maxOutput = 6000
+	bodyLimit := params.Limit
+	if bodyLimit <= 0 {
+		bodyLimit = 6000
 	}
-
-	content, err := os.ReadFile(fullPath)
-	if err != nil {
-		return ToolResult{Name: "read_file", Success: false, Error: err.Error()}
-	}
-
-	lines := strings.Split(string(content), "\n")
-	totalLines := len(lines)
-
 	offset := params.Offset
 	if offset < 0 {
 		offset = 0
 	}
-	if offset >= totalLines {
-		return ToolResult{Name: "read_file", Success: false, Error: "offset beyond file length"}
+
+	type fileResult struct {
+		path      string
+		relPath   string
+		fromLine  int    // 1-based inclusive; 0 for "full file"
+		toLine    int    // 1-based inclusive
+		total     int
+		truncated bool   // body was clipped at maxOutput
+		body      string
+		err       error
+	}
+	results := make([]fileResult, 0, len(params.Paths))
+	for _, p := range params.Paths {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		fullPath, err := th.resolvePath(p)
+		if err != nil {
+			results = append(results, fileResult{path: p, err: err})
+			continue
+		}
+		data, err := os.ReadFile(fullPath)
+		if err != nil {
+			results = append(results, fileResult{path: p, err: err})
+			continue
+		}
+		lines := strings.Split(string(data), "\n")
+		total := len(lines)
+		start := offset
+		if start >= total {
+			results = append(results, fileResult{path: p, total: total, fromLine: 1, toLine: 0})
+			continue
+		}
+		end := offset + bodyLimit
+		if end > total {
+			end = total
+		}
+		body := strings.Join(lines[start:end], "\n")
+		truncated := false
+		if len(body) > maxOutput {
+			body = body[:maxOutput]
+			body += "\n... (truncated)"
+			truncated = true
+		}
+		relPath := th.displayPath(fullPath)
+		fr := fileResult{
+			path:     p,
+			relPath:  relPath,
+			body:     body,
+			total:    total,
+			fromLine: start + 1,
+			toLine:   end,
+			truncated: truncated,
+		}
+		results = append(results, fr)
 	}
 
-	limit := params.Limit
-	if limit <= 0 {
-		limit = 6000
+	// Build per-file sub-results for Data field.
+	var dataResults []ToolResult
+	for _, r := range results {
+		sub := ToolResult{Name: "read_files", Path: r.relPath}
+		if r.err != nil {
+			sub.Success = false
+			sub.Error = r.err.Error()
+			sub.Output = fmt.Sprintf("=== %s ===\nerror: %s", r.path, r.err.Error())
+		} else {
+			sub.Success = true
+			if r.fromLine == 1 && r.toLine >= r.total {
+				sub.Output = fmt.Sprintf("=== %s ===\n%s", r.relPath, r.body)
+			} else {
+				sub.Output = fmt.Sprintf("=== %s (%d-%d) ===\n%s", r.relPath, r.fromLine, r.toLine, r.body)
+			}
+		}
+		dataResults = append(dataResults, sub)
 	}
 
-	end := offset + limit
-	if end > totalLines {
-		end = totalLines
+	if len(results) == 0 {
+		return ToolResult{Name: "read_files", Success: false, Error: "no readable paths provided"}
 	}
 
-	selectedLines := lines[offset:end]
-	output := strings.Join(selectedLines, "\n")
-
-	if len(output) > 6000 {
-		output = output[:6000]
-		output += "\n... (truncated)"
+	// Build the model-facing body. Each file section: optional range suffix,
+	// then the body. Failed files get an inline error message.
+	var sb strings.Builder
+	readCount := 0
+	for _, r := range results {
+		if r.err != nil {
+			sb.WriteString(fmt.Sprintf("=== %s ===\nerror: %s\n\n", r.path, r.err.Error()))
+			continue
+		}
+		readCount++
+		isFull := r.fromLine == 1 && r.toLine >= r.total
+		if isFull {
+			sb.WriteString(fmt.Sprintf("=== %s ===\n%s\n\n", r.relPath, r.body))
+		} else {
+			sb.WriteString(fmt.Sprintf("=== %s (%d-%d) ===\n%s\n\n", r.relPath, r.fromLine, r.toLine, r.body))
+		}
 	}
+	body := strings.TrimRight(sb.String(), "\n")
 
-	return ToolResult{Name: "read_file", Success: true, Output: output, Path: params.Path, Lines: fmt.Sprintf("%d-%d/%d", offset+1, end, totalLines)}
+	// Attach per-file metadata so the UI can render a tree without
+	// re-parsing the body. Lines is a JSON array, one entry per file.
+	type entry struct {
+		Path    string `json:"path"`
+		Range   string `json:"range,omitempty"`
+		Truncated bool  `json:"truncated,omitempty"`
+		Error   string `json:"error,omitempty"`
+	}
+	var metaEntries []entry
+	for _, r := range results {
+		e := entry{Path: r.relPath}
+		if r.err != nil {
+			e.Error = r.err.Error()
+		} else if r.fromLine == 1 && r.toLine >= r.total {
+			// full file, skip Range
+		} else {
+			e.Range = fmt.Sprintf("%d-%d", r.fromLine, r.toLine)
+			if r.truncated {
+				e.Truncated = true
+			}
+		}
+		metaEntries = append(metaEntries, e)
+	}
+	metaJSON, _ := json.Marshal(metaEntries)
+	summary := params.Paths[0]
+	if len(params.Paths) > 1 {
+		summary = ""
+	}
+	return ToolResult{
+		Name:    "read_files",
+		Success: readCount > 0,
+		Output:  body,
+		Path:    summary,
+		Lines:   string(metaJSON),
+		Data:    dataResults,
+	}
 }
 
 func (th *ToolHandler) executeWriteFile(args string) ToolResult {
@@ -396,7 +519,7 @@ func (th *ToolHandler) executeEditFile(args string) ToolResult {
 	newContent := strings.Replace(oldContent, params.Find, params.Replace, 1)
 
 	if oldContent == newContent {
-		return ToolResult{Name: "edit_file", Success: false, Error: "Text not found: '" + params.Find + "' was not found in the file. Use read_file tool to see the exact content, paying attention to whitespace and special characters."}
+		return ToolResult{Name: "edit_file", Success: false, Error: "Text not found: '" + params.Find + "' was not found in the file. Use read_files tool to see the exact content, paying attention to whitespace and special characters."}
 	}
 
 	if err := os.WriteFile(fullPath, []byte(newContent), 0644); err != nil {
@@ -1026,55 +1149,178 @@ func (th *ToolHandler) executeEditSoul(args string) ToolResult {
 	return ToolResult{Name: "edit_soul", Success: true, Output: fmt.Sprintf("Updated SOUL.md in %s", configDir)}
 }
 
+// formatDiff produces a unified-diff style preview of the change between two
+// file versions. Each output line begins with a single marker character
+// (' ', '+', '-') followed by the line text — we deliberately omit line
+// numbers to keep the diff compact and easy to read. Identical context at
+// the start and end of the file is collapsed into one "... N unchanged
+// lines ..." row so we don't print redundant context twice.
 func formatDiff(oldContent, newContent string) string {
-	oldLines := strings.Split(oldContent, "\n")
-	newLines := strings.Split(newContent, "\n")
+	oldLines := splitTrailingNL(oldContent)
+	newLines := splitTrailingNL(newContent)
 
-	start := 0
-	for start < len(oldLines) && start < len(newLines) && oldLines[start] == newLines[start] {
-		start++
-	}
-
-	oldEnd := len(oldLines) - 1
-	newEnd := len(newLines) - 1
-	for oldEnd >= start && newEnd >= start && oldLines[oldEnd] == newLines[newEnd] {
-		oldEnd--
-		newEnd--
-	}
-
-	if start > oldEnd && start > newEnd {
+	if len(oldLines) == 0 && len(newLines) == 0 {
 		return "No changes"
 	}
 
-	contextLines := 2
-	ctxStart := start - contextLines
-	if ctxStart < 0 {
-		ctxStart = 0
+	m, n := len(oldLines), len(newLines)
+	dp := make([][]int, m+1)
+	for i := range dp {
+		dp[i] = make([]int, n+1)
 	}
-	ctxOldEnd := oldEnd + contextLines
-	if ctxOldEnd >= len(oldLines) {
-		ctxOldEnd = len(oldLines) - 1
-	}
-	ctxNewEnd := newEnd + contextLines
-	if ctxNewEnd >= len(newLines) {
-		ctxNewEnd = len(newLines) - 1
-	}
-
-	var diff []string
-	for i := ctxStart; i < start; i++ {
-		diff = append(diff, fmt.Sprintf(" %d: %s", i+1, oldLines[i]))
-	}
-	for i := start; i <= oldEnd; i++ {
-		diff = append(diff, fmt.Sprintf("-%d: %s", i+1, oldLines[i]))
-	}
-	for i := start; i <= newEnd; i++ {
-		diff = append(diff, fmt.Sprintf("+%d: %s", i+1, newLines[i]))
-	}
-	for i := oldEnd + 1; i <= ctxOldEnd; i++ {
-		diff = append(diff, fmt.Sprintf(" %d: %s", i+1, oldLines[i]))
+	for i := m - 1; i >= 0; i-- {
+		for j := n - 1; j >= 0; j-- {
+			if oldLines[i] == newLines[j] {
+				dp[i][j] = dp[i+1][j+1] + 1
+			} else if dp[i+1][j] >= dp[i][j+1] {
+				dp[i][j] = dp[i+1][j]
+			} else {
+				dp[i][j] = dp[i][j+1]
+			}
+		}
 	}
 
-	return strings.Join(diff, "\n")
+	type op int
+	const (
+		opEq op = iota
+		opDel
+		opIns
+	)
+	type hunk struct {
+		kind op
+		old  []string
+		new  []string
+		skip int
+	}
+	var hunks []hunk
+	var (
+		bufEqOld, bufEqNew []string
+		bufDel             []string
+		bufIns             []string
+	)
+	flushEq := func() {
+		if len(bufEqOld) == 0 {
+			return
+		}
+		hunks = append(hunks, hunk{kind: opEq, old: append([]string(nil), bufEqOld...), new: append([]string(nil), bufEqNew...)})
+		bufEqOld, bufEqNew = nil, nil
+	}
+	flushDel := func() {
+		if len(bufDel) == 0 {
+			return
+		}
+		hunks = append(hunks, hunk{kind: opDel, old: append([]string(nil), bufDel...)})
+		bufDel = nil
+	}
+	flushIns := func() {
+		if len(bufIns) == 0 {
+			return
+		}
+		hunks = append(hunks, hunk{kind: opIns, new: append([]string(nil), bufIns...)})
+		bufIns = nil
+	}
+
+	i, j := 0, 0
+	canEqStep := func() bool { return i < m && j < n && oldLines[i] == newLines[j] }
+	for i < m || j < n {
+		if canEqStep() {
+			flushDel()
+			flushIns()
+			for canEqStep() {
+				bufEqOld = append(bufEqOld, oldLines[i])
+				bufEqNew = append(bufEqNew, newLines[j])
+				i++
+				j++
+			}
+			flushEq()
+			continue
+		}
+		if j >= n || (i < m && dp[i+1][j] >= dp[i][j+1]) {
+			bufDel = append(bufDel, oldLines[i])
+			i++
+		} else {
+			bufIns = append(bufIns, newLines[j])
+			j++
+		}
+	}
+	flushDel()
+	flushIns()
+	flushEq()
+
+	// Collapse redundant outer opEq blocks: keep at most contextLines of
+	// lines on each end, drop the middle into a single skip marker.
+	const contextLines = 2
+	collapse := func(h hunk) []hunk {
+		if h.kind != opEq || len(h.old) <= contextLines*2 {
+			return []hunk{h}
+		}
+		return []hunk{
+			{kind: opEq, old: h.old[:contextLines], new: h.new[:contextLines]},
+			{kind: opEq, skip: len(h.old) - contextLines*2},
+			{kind: opEq, old: h.old[len(h.old)-contextLines:], new: h.new[len(h.new)-contextLines:]},
+		}
+	}
+	if len(hunks) > 0 && hunks[0].kind == opEq {
+		hunks = append(collapse(hunks[0]), hunks[1:]...)
+	}
+	if len(hunks) > 0 && hunks[len(hunks)-1].kind == opEq {
+		last := hunks[len(hunks)-1]
+		hunks = hunks[:len(hunks)-1]
+		hunks = append(hunks, collapse(last)...)
+	}
+
+	var rows []string
+	for _, h := range hunks {
+		if h.kind == opEq && h.skip > 0 {
+			rows = append(rows, fmt.Sprintf("   ... %d unchanged line%s ...", h.skip, plural(h.skip)))
+			continue
+		}
+		switch h.kind {
+		case opEq:
+			for _, line := range h.old {
+				rows = append(rows, " "+line)
+			}
+		case opDel:
+			for _, line := range h.old {
+				rows = append(rows, "-"+line)
+			}
+		case opIns:
+			for _, line := range h.new {
+				rows = append(rows, "+"+line)
+			}
+		}
+	}
+	if len(rows) == 0 {
+		return "No changes"
+	}
+	// If nothing actually changed (all hunks are opEq) collapse to a single
+	// notice so we don't render a context-only diff that hides the message.
+	hadChange := false
+	for _, h := range hunks {
+		if h.kind != opEq {
+			hadChange = true
+			break
+		}
+	}
+	if !hadChange {
+		return "No changes"
+	}
+	return strings.Join(rows, "\n")
+}
+
+func splitTrailingNL(s string) []string {
+	lines := strings.Split(s, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 func (th *ToolHandler) resolvePath(path string) (string, error) {
@@ -1089,6 +1335,11 @@ func (th *ToolHandler) resolvePath(path string) (string, error) {
 	target := strings.TrimSpace(path)
 	if target == "" {
 		target = "."
+	}
+	// Normalise leading "./" so model-side paths and tool-side paths agree.
+	for strings.HasPrefix(target, "./") || strings.HasPrefix(target, ".\\") {
+		target = strings.TrimPrefix(target, "./")
+		target = strings.TrimPrefix(target, ".\\")
 	}
 	if !filepath.IsAbs(target) {
 		target = filepath.Join(base, target)
@@ -1121,6 +1372,39 @@ func (th *ToolHandler) resolvePath(path string) (string, error) {
 	return target, nil
 }
 
+// displayPath converts an absolute filesystem path to its canonical
+// relative form under the working directory. The result always carries a
+// leading "./" so that "./foo.go" and "foo.go" stay visually distinct as
+// paths, but never a stray leading "././" or doubled slashes. Returns the
+// absolute path unchanged if it lives outside the working dir.
+func (th *ToolHandler) displayPath(absPath string) string {
+	return displayPath(absPath, th.workingDir)
+}
+
+func displayPath(absPath, workingDir string) string {
+	base, err := filepath.Abs(workingDir)
+	if err != nil {
+		return absPath
+	}
+	if resolvedBase, err := filepath.EvalSymlinks(base); err == nil {
+		base = resolvedBase
+	}
+	target := absPath
+	if resolved, err := filepath.EvalSymlinks(target); err == nil {
+		target = resolved
+	}
+	rel, err := filepath.Rel(base, target)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return absPath
+	}
+	if rel == "." || rel == "" {
+		return "."
+	}
+	return "./" + filepath.ToSlash(rel)
+}
+
+const maxToolOutputSize = 50 * 1024 // 50KB
+
 func FormatToolResult(result ToolResult) string {
 	if !result.Success {
 		if result.Error != "" {
@@ -1129,6 +1413,14 @@ func FormatToolResult(result ToolResult) string {
 		return "Error: unknown error"
 	}
 	if result.Output != "" {
+		if len(result.Output) > maxToolOutputSize {
+			truncated := result.Output[:maxToolOutputSize]
+			lastNewline := strings.LastIndex(truncated, "\n")
+			if lastNewline > 0 {
+				truncated = truncated[:lastNewline]
+			}
+			return truncated + fmt.Sprintf("\n... output truncated (%d bytes omitted)", len(result.Output)-len(truncated))
+		}
 		return result.Output
 	}
 	return "Success"
@@ -1178,23 +1470,27 @@ func FormatToolResultCLI(result ToolResult, toolName, args string) string {
 		} else {
 			toolLabel = "bash"
 		}
-	case "read_file":
+	case "read_files":
 		var params struct {
-			Path   string `json:"path"`
-			Offset int    `json:"offset,omitempty"`
-			Limit  int    `json:"limit,omitempty"`
+			Paths  []string `json:"paths"`
+			Offset int      `json:"offset,omitempty"`
+			Limit  int      `json:"limit,omitempty"`
 		}
-		if json.Unmarshal([]byte(args), &params) == nil {
-			toolLabel = "read " + params.Path
-			if params.Offset > 0 || params.Limit > 0 {
-				toolLabel += fmt.Sprintf(" (line %d", params.Offset+1)
-				if params.Limit > 0 {
-					toolLabel += fmt.Sprintf(", %d lines", params.Limit)
+		if json.Unmarshal([]byte(args), &params) == nil && len(params.Paths) > 0 {
+			if len(params.Paths) == 1 {
+				toolLabel = "read " + params.Paths[0]
+				if params.Offset > 0 || params.Limit > 0 {
+					toolLabel += fmt.Sprintf(" (line %d", params.Offset+1)
+					if params.Limit > 0 {
+						toolLabel += fmt.Sprintf(", %d lines", params.Limit)
+					}
+					toolLabel += ")"
 				}
-				toolLabel += ")"
+			} else {
+				toolLabel = fmt.Sprintf("read_files (%d)", len(params.Paths))
 			}
 		} else {
-			toolLabel = "read_file"
+			toolLabel = "read_files"
 		}
 	case "grep":
 		var params struct {
@@ -1280,7 +1576,7 @@ func GetToolDefinitions() []any {
 					"type": "object",
 					"properties": map[string]any{
 						"command": map[string]any{"type": "string", "description": "The bash command to execute"},
-				"reason":   map[string]any{"type": "string", "description": "Required: Explain why you are using this tool"},
+						"reason":  map[string]any{"type": "string", "description": "Required: Explain why you are using this tool"},
 					},
 					"required": []string{"command", "reason"},
 				},
@@ -1302,16 +1598,20 @@ func GetToolDefinitions() []any {
 		map[string]any{
 			"type": "function",
 			"function": map[string]any{
-				"name":        "read_file",
-				"description": "Read the contents of a file under the working directory",
+				"name":        "read_files",
+				"description": "Read one or more files under the working directory. Prefer batching paths together in a single call instead of issuing one read per file, even when you only need the headlines of each.",
 				"parameters": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"path":   map[string]any{"type": "string", "description": "The file path"},
-						"offset": map[string]any{"type": "integer", "description": "Line number to start reading from (0-based)"},
-						"limit":  map[string]any{"type": "integer", "description": "Maximum number of lines to read (default: all or 6000 chars)"},
+						"paths": map[string]any{
+							"type":  "array",
+							"items": map[string]any{"type": "string"},
+							"description": "Files to read. Always batch multiple files into a single call when you need them together — this is much cheaper than many separate calls.",
+						},
+						"offset": map[string]any{"type": "integer", "description": "Line number to start reading from (0-based); applies to every file in the batch."},
+						"limit":  map[string]any{"type": "integer", "description": "Maximum number of lines to read per file (default: 6000 chars)."},
 					},
-					"required": []string{"path"},
+					"required": []string{"paths"},
 				},
 			},
 		},
@@ -1487,7 +1787,6 @@ func truncate(value string, limit int) string {
 	return value[:limit-3] + "..."
 }
 
-
 // ExecuteParallel runs multiple tool calls concurrently when they are independent.
 // It detects dependencies between calls (e.g., one call depends on the output of
 // a previous call) and runs dependent calls sequentially while independent ones
@@ -1523,7 +1822,7 @@ func (th *ToolHandler) ExecuteParallel(calls []ToolCall) []ToolResult {
 
 // groupIndependentCalls analyzes tool calls and groups independent ones together
 // so they can be executed in parallel. Calls are dependent if:
-// - A write_file or edit_file targets a path that a previous read_file references
+// - A write_file or edit_file targets a path that a previous read_files references
 // - An edit_file targets a path that a previous edit_file or write_file also targets
 // - A bash command might depend on a previous write_file/edit_file
 func (th *ToolHandler) groupIndependentCalls(calls []ToolCall) [][]int {
@@ -1572,6 +1871,21 @@ func (th *ToolHandler) groupIndependentCalls(calls []ToolCall) [][]int {
 
 // isDependent checks if a tool call depends on any previously tracked write/read paths
 func (th *ToolHandler) isDependent(call ToolCall, writtenPaths, readPaths map[string]bool) bool {
+	// read_files: check each path against writtenPaths
+	if call.Name == "read_files" {
+		var params struct {
+			Paths []string `json:"paths"`
+		}
+		if err := json.Unmarshal([]byte(call.Args), &params); err == nil {
+			for _, p := range params.Paths {
+				if writtenPaths[p] {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
 	path, isWrite := th.getCallPathAndType(call)
 	if path == "" {
 		// bash commands are treated as potentially dependent on writes
@@ -1602,12 +1916,26 @@ func (th *ToolHandler) isDependent(call ToolCall, writtenPaths, readPaths map[st
 
 // trackPaths records the paths read/written by a tool call
 func (th *ToolHandler) trackPaths(call ToolCall, writtenPaths, readPaths map[string]bool) {
-	path, isWrite := th.getCallPathAndType(call)
-	if path != "" {
-		if isWrite {
-			writtenPaths[path] = true
-		} else {
-			readPaths[path] = true
+	switch call.Name {
+	case "read_files":
+		var params struct {
+			Paths []string `json:"paths"`
+		}
+		if err := json.Unmarshal([]byte(call.Args), &params); err == nil {
+			for _, p := range params.Paths {
+				if p != "" {
+					readPaths[p] = true
+				}
+			}
+		}
+	default:
+		path, isWrite := th.getCallPathAndType(call)
+		if path != "" {
+			if isWrite {
+				writtenPaths[path] = true
+			} else {
+					readPaths[path] = true
+			}
 		}
 	}
 }
@@ -1622,12 +1950,15 @@ func (th *ToolHandler) getCallPathAndType(call ToolCall) (string, bool) {
 		if err := json.Unmarshal([]byte(call.Args), &params); err == nil && params.Path != "" {
 			return params.Path, true
 		}
-	case "read_file":
+	case "read_files":
 		var params struct {
-			Path string `json:"path"`
+			Paths []string `json:"paths"`
 		}
-		if err := json.Unmarshal([]byte(call.Args), &params); err == nil && params.Path != "" {
-			return params.Path, false
+		if err := json.Unmarshal([]byte(call.Args), &params); err == nil {
+			// Return first path for dependency tracking; all paths are reads.
+			if len(params.Paths) > 0 {
+				return params.Paths[0], false
+			}
 		}
 	case "list_files":
 		var params struct {

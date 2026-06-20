@@ -129,12 +129,17 @@ func (c *Config) saveToProfile() {
 		profileName = activeProfile.Name
 	}
 
-	_ = storage.SaveProfile(storage.Profile{
+	existing, _ := storage.GetProfile(profileName)
+	profile := storage.Profile{
 		Name:   profileName,
 		APIURL: c.APIURL,
 		APIKey: c.APIKey,
 		Model:  c.Model,
-	})
+	}
+	if existing != nil {
+		profile.Permissions = existing.Permissions
+	}
+	_ = storage.SaveProfile(profile)
 }
 
 func getEnv(key, defaultVal string) string {

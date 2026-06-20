@@ -1,14 +1,18 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
 	"cardinal/pkg/api"
-	"cardinal/pkg/tools"
 	"cardinal/pkg/parser"
+	"cardinal/pkg/personality"
 	"cardinal/pkg/prompt"
+	"cardinal/pkg/storage"
+	"cardinal/pkg/tools"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -80,6 +84,12 @@ type thinkingMsg struct {
 	thinking string
 }
 
+type goalEvalMsg struct {
+	passed   bool
+	feedback string
+	err      error
+}
+
 func (m Model) fetchModels() tea.Cmd {
 	return func() tea.Msg {
 		models, err := m.client.ListModels()
@@ -114,6 +124,9 @@ func calculateBackoff(attempt int) time.Duration {
 
 func (m Model) buildMessages() []api.Message {
 	systemPrompt := m.getSystemPrompt()
+	if m.goalMode && strings.TrimSpace(m.goalText) != "" {
+		systemPrompt += "\n\nGOAL MODE ACTIVE: Keep working on this goal until an external verifier passes it. Goal: " + m.goalText + ". Do not stop early. If verifier feedback appears, address it directly and continue."
+	}
 	messages := append([]api.Message{{Role: "system", Content: systemPrompt}}, m.messages...)
 	messages = m.compressMessages(messages)
 	return messages
@@ -219,8 +232,9 @@ func (m Model) doCompress(messages []api.Message) []api.Message {
 }
 
 func (m Model) getSystemPrompt() string {
-	builder := prompt.NewPromptBuilder(m.working, m.soul)
-	if strings.TrimSpace(m.cfg.SystemPrompt) != "" {
+	builder := prompt.NewPromptBuilder(m.working, m.soul, personality.Load())
+	defaultPrompt := "You are Cardinal, a helpful coding assistant. Be concise and direct."
+	if strings.TrimSpace(m.cfg.SystemPrompt) != "" && m.cfg.SystemPrompt != defaultPrompt {
 		builder.SetSectionContent("identity", m.cfg.SystemPrompt)
 	}
 	return builder.Build()
@@ -233,11 +247,15 @@ func (m Model) beginStream() (tea.Model, tea.Cmd) {
 	m.streaming = ""
 	m.thinking = ""
 	m.pendingToolCalls = nil
+	m.streamChars = 0
+	m.thinkingChars = 0
+	m.toolCallChars = 0
+	m.toolCallName = ""
 	m.busy = true
 	m.err = nil
 	m.status = thinkingMessages[0]
 	m.thinkingIdx = 0
-	return m, tea.Batch(waitForStreamEvent(m.streamCh), startSpinnerTicker())
+	return m, tea.Batch(waitForStreamEvent(m.streamCh), startSpinnerTicker(), startScrollbackTicker())
 }
 
 func (m *Model) setStatus(newStatus string) {
@@ -263,12 +281,14 @@ func getStatusPriority(status string) int {
 	switch {
 	case strings.Contains(lower, "error"):
 		return 0
-	case strings.Contains(lower, "writing") || strings.Contains(lower, "retrying"):
+	case strings.Contains(lower, "validating") || strings.Contains(lower, "review"):
 		return 1
-	case strings.Contains(lower, "receiving"):
+	case strings.Contains(lower, "writing") || strings.Contains(lower, "retrying"):
 		return 2
-	case strings.Contains(lower, "thinking") || strings.Contains(lower, "hmm") || strings.Contains(lower, "ponder"):
+	case strings.Contains(lower, "receiving"):
 		return 3
+	case strings.Contains(lower, "thinking") || strings.Contains(lower, "hmm") || strings.Contains(lower, "ponder"):
+		return 4
 	default:
 		return 2
 	}
@@ -277,32 +297,37 @@ func getStatusPriority(status string) int {
 func (m Model) handleStreamEvent(event api.StreamEvent) (tea.Model, tea.Cmd) {
 	switch event.Type {
 	case "content":
+		event.Content = stripThinkingTags(event.Content)
 		m.streaming += event.Content
-		m.setStatus("Receiving response")
+		m.streamChars += len(event.Content)
+		m.status = fmt.Sprintf("Writing response · %d chars", m.streamChars)
 		m.retryCount = 0
 		return m, waitForStreamEvent(m.streamCh)
 
 	case "thinking":
 		m.thinking += event.Thinking
-		m.setStatus("Thinking")
+		m.thinkingChars += len(event.Thinking)
+		
+		
+		m.status = fmt.Sprintf("Thinking · %d chars", m.thinkingChars)
 		return m, waitForStreamEvent(m.streamCh)
 
 	case "tool_call_writing":
 		toolCount := len(m.pendingToolCalls) + 1 // +1 for the one being written now
-		if event.ToolCallName != "" && event.ToolCallArgsLen > 0 {
-			if toolCount > 1 {
-				m.setStatus(fmt.Sprintf("Writing tool call %d [%s] (%d chars)", toolCount, event.ToolCallName, event.ToolCallArgsLen))
-			} else {
-				m.setStatus(fmt.Sprintf("Writing tool call [%s] (%d characters)", event.ToolCallName, event.ToolCallArgsLen))
-			}
-		} else if event.ToolCallName != "" {
-			if toolCount > 1 {
-				m.setStatus(fmt.Sprintf("Writing tool call %d [%s]", toolCount, event.ToolCallName))
-			} else {
-				m.setStatus(fmt.Sprintf("Writing tool call [%s]", event.ToolCallName))
-			}
+		if event.ToolCallName != "" {
+			m.toolCallName = event.ToolCallName
+		}
+		if event.ToolCallArgsLen > 0 {
+			m.toolCallChars = event.ToolCallArgsLen
+		}
+		name := m.toolCallName
+		if name == "" {
+			name = "tool"
+		}
+		if toolCount > 1 {
+			m.status = fmt.Sprintf("Writing %d tool calls · %s · %d chars", toolCount, name, m.toolCallChars)
 		} else {
-			m.setStatus("Writing tool call...")
+			m.status = fmt.Sprintf("Writing tool call · %s · %d chars", name, m.toolCallChars)
 		}
 		return m, waitForStreamEvent(m.streamCh)
 
@@ -329,7 +354,7 @@ func (m Model) handleStreamEvent(event api.StreamEvent) (tea.Model, tea.Cmd) {
 		return m.finishAssistantTurn()
 
 	case "error":
-		logBadRequestError(event.Error, m.cfg.Model, m.buildMessages(), m.toolDefs)
+		logAPIError(event.Error, m.cfg.Model, m.buildMessages(), m.toolDefs)
 
 		if shouldRetry(event.Error, m.retryCount) {
 			m.retryCount++
@@ -474,22 +499,16 @@ func (m *Model) addToolResult(name, content, toolCallID string, args ...string) 
 // finalizeUIMessageHandling updates UI state after adding messages
 func (m *Model) finalizeUIMessageHandling() {
 	m.scrollOffset = 0
-	m.useViewport = true
-	m.updateViewportContent()
-	// Only scroll to bottom if content is taller than viewport
-	if m.viewport.TotalLineCount() > m.viewport.Height {
-		m.viewport.GotoBottom()
-	}
+	m.useViewport = false
 }
 
 func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 	m.streamCh = nil
 
-	// Check for XML-formatted tool calls in content
+	// Check for text-formatted tool calls in content. Tool use must come through the API.
 	if parser.ContainsToolCalls(m.thinking) || parser.ContainsToolCalls(m.streaming) {
-		// Store thinking separately, not duplicated in content
 		m.addAssistantMessageWithThinking(m.streaming, m.thinking)
-		m.addToolResult("format_error", "Error: Your message was ignored because it contained XML-formatted tool calls. You MUST use the proper function calling API with JSON format. Do NOT write tool calls as text in your message. The system will handle tool execution for you. Just respond normally and the tools will be called automatically through the API.", "")
+		m.addToolResult("format_error", "Error: Your message was ignored because it looked like a tool call written as text. You MUST use the function calling API. Do not output JSON arguments, XML tool calls, or raw tool-call text. If you need a tool, call it through the tool interface; otherwise answer normally.", "")
 		m.finalizeUIMessageHandling()
 		return m.beginStream()
 	}
@@ -538,19 +557,20 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 			for i := range toolCalls {
 				approvals[i] = m.autoApprove || !tools.RequiresApproval(toolCalls[i].Function.Name)
 			}
-		m.busy = true
-		toolCount := approvedToolCount(approvals)
-		if toolCount > 1 {
-			m.setStatus(fmt.Sprintf("Running %d tools in parallel", toolCount))
-		} else {
-			m.setStatus("Running tool")
-		}
-		return m, m.executeToolPlanCmd(streamingContent, thinkingContent, toolCalls, approvals)
+			m.busy = true
+			toolCount := approvedToolCount(approvals)
+			if toolCount > 1 {
+				m.setStatus(fmt.Sprintf("Running %d tools in parallel", toolCount))
+			} else {
+				m.setStatus("Running tool")
+			}
+			return m, m.executeToolPlanCmd(streamingContent, thinkingContent, toolCalls, approvals)
 		}
 
-		// All tools need approval
-		m.mode = "permissions"
-		m.modeData = newPermissionMode(streamingContent, thinkingContent, toolCalls)
+		// All tools need approval — show inline approval card (no
+		// separate full-screen mode).
+		m.pendingApproval = newPermissionMode(streamingContent, thinkingContent, toolCalls)
+		m.pendingApproval.selected = 0
 		m.busy = false
 		m.setStatus("Tool approval required")
 		return m, nil
@@ -564,8 +584,6 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 	m.thinking = ""
 
 	if streamingContent != "" || thinkingContent != "" {
-		// If we only have thinking, store it as thinking only (empty content)
-		// If we have both, store them separately
 		if streamingContent == "" && thinkingContent != "" {
 			m.addAssistantMessageWithThinking("", thinkingContent)
 		} else {
@@ -574,9 +592,129 @@ func (m Model) finishAssistantTurn() (tea.Model, tea.Cmd) {
 		m.finalizeUIMessageHandling()
 	}
 
+	if m.needsCompletionCheck() {
+		m.completionChecks++
+		m.busy = true
+		m.setStatus("Validating response")
+		return m, m.evaluateGoalCmd()
+	}
+
+	if m.needsTodoCheck() {
+		m.todoChecks++
+		m.busy = true
+		m.setStatus("Checking todos")
+		return m, m.evaluateTodoCmd()
+	}
+
 	m.busy = false
 	m.setStatus("Ready")
 	return m, nil
+}
+
+func (m Model) needsCompletionCheck() bool {
+	if !m.goalMode || strings.TrimSpace(m.goalText) == "" {
+		return false
+	}
+	if m.completionChecks >= 5 {
+		return false
+	}
+	if len(m.messages) == 0 {
+		return false
+	}
+	last := m.messages[len(m.messages)-1]
+	if last.Role == "system" && strings.Contains(last.Content, "Goal verifier feedback:") {
+		return false
+	}
+	return true
+}
+
+func (m Model) evaluateGoalCmd() tea.Cmd {
+	goal := m.goalText
+	conversation := compactGoalTranscript(m.messages)
+	client := m.client
+	model := m.cfg.Model
+	return func() tea.Msg {
+		messages := []api.Message{
+			{Role: "system", Content: "You are a strict completion verifier. Decide if the assistant has fully satisfied the user's goal. Reply with exactly one JSON object: {\"passed\":true|false,\"feedback\":\"short reason or next required action\"}. Be strict: pass only if the goal is actually satisfied."},
+			{Role: "user", Content: "Goal:\n" + goal + "\n\nConversation transcript:\n" + conversation},
+		}
+		msg, _, err := client.Chat(model, messages, nil, 512)
+		if err != nil {
+			return goalEvalMsg{err: err}
+		}
+		passed, feedback := parseGoalEval(msg.Content)
+		return goalEvalMsg{passed: passed, feedback: feedback}
+	}
+}
+
+func compactGoalTranscript(messages []api.Message) string {
+	var b strings.Builder
+	for _, msg := range messages {
+		if msg.Role == "system" {
+			continue
+		}
+		content := strings.TrimSpace(msg.Content)
+		if msg.Role == "tool" {
+			content = msg.Name + ": " + content
+		}
+		if content == "" && len(msg.ToolCalls) > 0 {
+			var names []string
+			for _, tc := range msg.ToolCalls {
+				names = append(names, tc.Function.Name)
+			}
+			content = "tool calls: " + strings.Join(names, ", ")
+		}
+		if content == "" {
+			continue
+		}
+		if len(content) > 1200 {
+			content = content[:1200] + "..."
+		}
+		b.WriteString(msg.Role + ": " + content + "\n")
+	}
+	return b.String()
+}
+
+func parseGoalEval(content string) (bool, string) {
+	var out struct {
+		Passed   bool   `json:"passed"`
+		Feedback string `json:"feedback"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(content)), &out); err == nil {
+		return out.Passed, strings.TrimSpace(out.Feedback)
+	}
+	lower := strings.ToLower(content)
+	if strings.Contains(lower, "\"passed\":true") || strings.Contains(lower, "passed: true") {
+		return true, "Goal verified."
+	}
+	return false, strings.TrimSpace(content)
+}
+
+func (m Model) handleGoalEval(msg goalEvalMsg) (tea.Model, tea.Cmd) {
+	if msg.err != nil {
+		logAPIError(msg.err, m.cfg.Model, nil, nil)
+		m.err = msg.err
+		m.busy = false
+		m.setStatus("Verifier failed")
+		return m, nil
+	}
+	feedback := strings.TrimSpace(msg.feedback)
+	if feedback == "" {
+		feedback = "No feedback."
+	}
+	if msg.passed {
+		m.goalMode = false
+		m.goalText = ""
+		m.completionChecks = 0
+		m.todoChecks = 0
+		m.finalizeUIMessageHandling()
+		m.setStatus("Ready")
+		return m, nil
+	}
+	m.messages = append(m.messages, api.Message{Role: "system", Content: "Goal verifier feedback: " + feedback + "\nContinue working until this feedback is satisfied. Do not stop until the verifier passes."})
+	m.finalizeUIMessageHandling()
+	m.setStatus("Continuing goal")
+	return m.beginStream()
 }
 
 func (m Model) executeToolPlanCmd(assistantContent, thinkingContent string, toolCalls []api.ToolCall, approvals []bool) tea.Cmd {
@@ -588,8 +726,10 @@ func (m Model) executeToolPlanCmd(assistantContent, thinkingContent string, tool
 		m.soul = loadSoul()
 	}
 
+	todos := m.todoStore
+
 	return func() tea.Msg {
-		results := executeToolPlan(working, toolCallsCopy, approvalsCopy, onEditSoul)
+		results := executeToolPlan(working, todos, toolCallsCopy, approvalsCopy, onEditSoul)
 		return toolExecutionMsg{
 			assistantContent: assistantContent,
 			thinkingContent:  thinkingContent,
@@ -602,7 +742,7 @@ func (m Model) executeToolPlanCmd(assistantContent, thinkingContent string, tool
 func (m Model) handleToolExecution(msg toolExecutionMsg) (tea.Model, tea.Cmd) {
 	m.addAssistantMessageWithThinking(msg.assistantContent, msg.thinkingContent, msg.toolCalls...)
 
-	// Add tool results
+	completed := false
 	for i, result := range msg.results {
 		name := result.Name
 		var args string
@@ -614,10 +754,199 @@ func (m Model) handleToolExecution(msg toolExecutionMsg) (tea.Model, tea.Cmd) {
 			args = msg.toolCalls[i].Function.Arguments
 			toolCallID = msg.toolCalls[i].ID
 		}
-		m.addToolResult(name, tools.FormatToolResult(result), toolCallID, args)
+		if name == "yes" && result.Success {
+			completed = true
+		}
+
+		if len(result.Data) > 0 {
+			// Emit one tool result message per sub-result (e.g. per-file for read_files).
+			for _, sub := range result.Data {
+				m.addToolResult(name, tools.FormatToolResult(sub), toolCallID, args)
+			}
+			// Attach the top-level metadata (e.g. per-file line ranges) to the last
+			// sub-message so the UI can render the tree.
+			if result.Lines != "" {
+				if n := len(m.messages); n > 0 {
+					m.messages[n-1].MetaLines = result.Lines
+				}
+			}
+		} else {
+			m.addToolResult(name, tools.FormatToolResult(result), toolCallID, args)
+			if result.Lines != "" {
+				if n := len(m.messages); n > 0 {
+					m.messages[n-1].MetaLines = result.Lines
+				}
+			}
+		}
+	}
+
+	m.finalizeUIMessageHandling()
+	if completed {
+		m.completionChecks = 0
+		m.todoChecks = 0
+		m.busy = false
+		m.setStatus("Ready")
+		return m, nil
 	}
 
 	m.setStatus("Continuing after tool results")
-	m.finalizeUIMessageHandling()
 	return m.beginStream()
 }
+
+var thinkingTagRE = regexp.MustCompile(`(?s)<thinking[^>]*>.*?</thinking>`)
+
+func stripThinkingTags(s string) string {
+	return thinkingTagRE.ReplaceAllString(s, "")
+}
+
+// needsTodoCheck reports whether the assistant just produced a natural text
+// reply (no tool calls, no pending goal verification) while the todo list
+// still contains unchecked items. If so the model may have actually completed
+// the work and just forgotten to check off the boxes — we ask an external
+// verifier to look and silently mark anything that's genuinely done.
+func (m Model) needsTodoCheck() bool {
+	if m.busy {
+		return false
+	}
+	if m.goalMode && strings.TrimSpace(m.goalText) != "" {
+		// Goal-mode verifier (if any) takes priority.
+		return false
+	}
+	if m.todoChecks >= 5 {
+		return false
+	}
+	if m.todoStore == nil {
+		return false
+	}
+	if len(m.todoStore.List("pending")) == 0 && len(m.todoStore.List("in_progress")) == 0 {
+		return false
+	}
+	// The most recent message must be an assistant message — we only nudge
+	// after the model explicitly stopped, never in the middle of a turn.
+	if len(m.messages) == 0 {
+		return false
+	}
+	last := m.messages[len(m.messages)-1]
+	if last.Role != "assistant" {
+		return false
+	}
+	// Avoid re-checking immediately after verifier feedback was just sent.
+	if strings.Contains(last.Content, "Todo verifier feedback:") {
+		return false
+	}
+	return true
+}
+
+func (m Model) evaluateTodoCmd() tea.Cmd {
+	client := m.client
+	model := m.cfg.Model
+	pending := m.todoStore.List("pending")
+	inProgress := m.todoStore.List("in_progress")
+	todos := append(append([]storage.TodoItem{}, pending...), inProgress...)
+	todoSnapshot := tools.FormatTodoList(todos)
+	transcript := compactGoalTranscript(m.messages)
+	return func() tea.Msg {
+		// Cap the transcript so we don't blow the verifier's context.
+		if len(transcript) > 4000 {
+			transcript = transcript[len(transcript)-4000:]
+		}
+		// System prompt asks for strict JSON; user prompt supplies the state.
+		// Note "tick off" rather than "update" matches the simplistic tool
+		// surface available (todo_write + status: completed).
+		verifierSystem := "You are a strict todo-list verifier. Given the assistant's " +
+			"recent work and the current todo list, decide which unchecked items " +
+			"have actually been completed but not yet marked done. Reply with exactly " +
+			"one JSON object: {\"ticked\":[\"id1\",\"id2\"],\"remaining\":[\"id3\"]}. " +
+			"Only tick an item if the transcript clearly shows the work was done " +
+			"(file edited, command run, output produced). When in doubt, leave it " +
+			"unchecked. If everything is genuinely done, return {\"ticked\":[],\"remaining\":[]}."
+		verifierUser := "Unchecked todos (id — title):\n" + todoSnapshot +
+			"\n\nRecent transcript:\n" + transcript
+		messages := []api.Message{
+			{Role: "system", Content: verifierSystem},
+			{Role: "user", Content: verifierUser},
+		}
+		resp, _, err := client.Chat(model, messages, nil, 512)
+		if err != nil {
+			return todoEvalMsg{err: err}
+		}
+		ticked, remaining := parseTodoEval(resp.Content)
+		return todoEvalMsg{ticked: ticked, remaining: remaining}
+	}
+}
+
+type todoEvalMsg struct {
+	ticked    []string
+	remaining []string
+	err       error
+}
+
+// handleTodoEval applies the verifier's verdict: silently tick off completed
+// items (with a one-line system note so the user can see what happened), and
+// if anything is still genuinely outstanding, feed it back as a system message
+// so the assistant keeps going. We deliberately do NOT mark items completed
+// ourselves — the model has to do it via todo_write so the assistant's
+// in-conversation state stays consistent.
+func (m Model) handleTodoEval(msg todoEvalMsg) (tea.Model, tea.Cmd) {
+	if msg.err != nil {
+		logAPIError(msg.err, m.cfg.Model, nil, nil)
+		m.err = msg.err
+		m.busy = false
+		m.setStatus("Todo verifier failed")
+		return m, nil
+	}
+	for _, id := range msg.ticked {
+		completed := storage.TodoCompleted
+		if _, err := m.todoStore.Update(id, &completed, nil); err == nil {
+			m.addSystemNote("todo verifier: ticked off #" + id)
+		}
+	}
+	if len(msg.remaining) == 0 {
+		m.todoChecks = 0
+		m.finalizeUIMessageHandling()
+		m.busy = false
+		m.setStatus("Ready")
+		return m, nil
+	}
+	// Build a short, specific reminder — names the items so the model knows
+	// exactly what still needs attention.
+	var b strings.Builder
+	b.WriteString("Todo verifier feedback: these items still look genuinely unfinished:\n")
+	for _, id := range msg.remaining {
+		b.WriteString("- #" + id + "\n")
+	}
+	b.WriteString("Continue working on them. When each is actually complete, call todo_write with action=update and status=completed so the list reflects reality.")
+	m.messages = append(m.messages, api.Message{Role: "system", Content: strings.TrimRight(b.String(), "\n")})
+	m.finalizeUIMessageHandling()
+	m.setStatus("Continuing todos")
+	return m.beginStream()
+}
+
+func parseTodoEval(content string) (ticked, remaining []string) {
+	var out struct {
+		Ticked    []string `json:"ticked"`
+		Remaining []string `json:"remaining"`
+	}
+	body := strings.TrimSpace(content)
+	if body == "" {
+		return nil, nil
+	}
+	// Strip ```json fences if the verifier wrapped its answer.
+	if strings.HasPrefix(body, "```") {
+		body = strings.TrimPrefix(body, "```")
+		if i := strings.Index(body, "\n"); i >= 0 {
+			body = body[i+1:]
+		}
+		if strings.HasSuffix(body, "```") {
+			body = strings.TrimSuffix(body, "```")
+		}
+	}
+	if err := json.Unmarshal([]byte(body), &out); err == nil {
+		return out.Ticked, out.Remaining
+	}
+	return nil, nil
+}
+
+// See tools.FormatTodoList for checklist rendering; this verifier reuses it
+// directly so we don't keep two visual formats in sync.
+

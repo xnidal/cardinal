@@ -13,9 +13,12 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"cardinal/pkg/parser"
-	promptpkg "cardinal/pkg/prompt"
+	"cardinal/pkg/api"
 	"cardinal/pkg/config"
+	"cardinal/pkg/parser"
+	"cardinal/pkg/personality"
+	promptpkg "cardinal/pkg/prompt"
+	"cardinal/pkg/storage"
 	"cardinal/pkg/tools"
 )
 
@@ -47,12 +50,13 @@ func main() {
 			runInstall()
 		case "run":
 			runCLI(cfg, strings.Join(args[1:], " "))
-	
+		default:
+			runCLI(cfg, strings.Join(args, " "))
 		}
 		return
 	}
 
-	p := tea.NewProgram(NewModel(cfg), tea.WithAltScreen())
+	p := tea.NewProgram(NewModel(cfg))
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -95,7 +99,7 @@ func runInstall() {
 
 func runCLI(cfg *config.Config, prompt string) {
 	working, _ := os.Getwd()
-	builder := promptpkg.NewPromptBuilder(working, "")
+	builder := promptpkg.NewPromptBuilder(working, "", personality.Load())
 	if cfg.SystemPrompt != "" && cfg.SystemPrompt != "You are Cardinal, a helpful coding assistant. Be concise and direct." {
 		builder.SetSectionContent("identity", cfg.SystemPrompt)
 	}
@@ -147,7 +151,7 @@ func runCLI(cfg *config.Config, prompt string) {
 		}
 
 		if streamErr != nil {
-			logBadRequestError(streamErr, cfg.Model, messages, toolDefs)
+			logAPIError(streamErr, cfg.Model, messages, toolDefs)
 
 			if shouldRetryCLI(streamErr, retryCount, maxRetries) {
 				retryCount++
@@ -162,8 +166,8 @@ func runCLI(cfg *config.Config, prompt string) {
 
 		retryCount = 0
 
-		// Check for XML-formatted tool calls in content
-	if parser.ContainsToolCalls(fullContent) {
+		// Check for text-formatted tool calls in content.
+		if parser.ContainsToolCalls(fullContent) {
 			messages = append(messages, api.Message{
 				Role:    "assistant",
 				Content: fullContent,
@@ -171,9 +175,9 @@ func runCLI(cfg *config.Config, prompt string) {
 			messages = append(messages, api.Message{
 				Role:       "tool",
 				ToolCallID: "format_error",
-				Content:    "Error: Your message was ignored because it contained XML-formatted tool calls. You MUST use the proper function calling API with JSON format. Do NOT write tool calls as text in your message. The system will handle tool execution for you. Just respond normally and the tools will be called automatically through the API.",
+				Content:    "Error: Your message was ignored because it looked like a tool call written as text. You MUST use the function calling API. Do not output JSON arguments, XML tool calls, or raw tool-call text. If you need a tool, call it through the tool interface; otherwise answer normally.",
 			})
-			fmt.Println("\n[Warning: XML tool call format detected - message ignored]")
+			fmt.Println("\n[Warning: text tool-call format detected - message ignored]")
 			continue
 		}
 
@@ -200,7 +204,8 @@ func runCLI(cfg *config.Config, prompt string) {
 
 		fmt.Println()
 		approvals := promptForToolApprovals(toolCalls)
-		results := executeToolPlan(working, toolCalls, approvals, nil)
+		todoStore := storage.NewTodoStore()
+		results := executeToolPlan(working, todoStore, toolCalls, approvals, nil)
 
 		messages = append(messages, api.Message{
 			Role:      "assistant",
@@ -209,13 +214,26 @@ func runCLI(cfg *config.Config, prompt string) {
 		})
 
 		for i, toolCall := range toolCalls {
-			formatted := tools.FormatToolResultCLI(results[i], toolCall.Function.Name, toolCall.Function.Arguments)
+			result := results[i]
+			formatted := tools.FormatToolResultCLI(result, toolCall.Function.Name, toolCall.Function.Arguments)
 			fmt.Println(formatted)
-			messages = append(messages, api.Message{
-				Role:       "tool",
-				ToolCallID: toolCall.ID,
-				Content:    tools.FormatToolResult(results[i]),
-			})
+
+			if len(result.Data) > 0 {
+				for _, sub := range result.Data {
+					messages = append(messages, api.Message{
+						Role:       "tool",
+						Name:       sub.Name,
+						Content:    tools.FormatToolResult(sub),
+						ToolCallID: toolCall.ID,
+					})
+				}
+			} else {
+				messages = append(messages, api.Message{
+					Role:       "tool",
+					ToolCallID: toolCall.ID,
+					Content:    tools.FormatToolResult(result),
+				})
+			}
 		}
 
 		fmt.Println()

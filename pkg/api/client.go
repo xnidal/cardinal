@@ -3,6 +3,10 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
 	"strings"
 
 	"github.com/openai/openai-go/v3"
@@ -18,6 +22,10 @@ type Message struct {
 	Name       string     `json:"name,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 	ToolArgs   string     `json:"tool_args,omitempty"`
+	// MetaLines is an optional structured payload attached by the tool layer
+	// (e.g. per-file line ranges for read_files). It is not sent to the
+	// model; the UI uses it to render tool cards without re-parsing bodies.
+	MetaLines string `json:"meta_lines,omitempty"`
 }
 
 type ToolCall struct {
@@ -57,13 +65,227 @@ type StreamEvent struct {
 	Usage           *Usage
 }
 
+// APIError captures everything needed to diagnose an upstream API failure:
+// the HTTP status, the full request/response dumps, headers, raw response body,
+// and the structured error fields (code/message/param/type) returned upstream.
 type APIError struct {
-	StatusCode int
-	Message    string
+	StatusCode   int               `json:"status_code"`
+	Method       string            `json:"method"`
+	URL          string            `json:"url"`
+	Message      string            `json:"message"`
+	ErrorCode    string            `json:"error_code,omitempty"`
+	ErrorParam   string            `json:"error_param,omitempty"`
+	ErrorType    string            `json:"error_type,omitempty"`
+	RequestBody  string            `json:"request_body,omitempty"`
+	RequestDump  string            `json:"request_dump,omitempty"`
+	ResponseRaw  string            `json:"response_raw,omitempty"`
+	ResponseDump string            `json:"response_dump,omitempty"`
+	Headers      map[string]string `json:"headers,omitempty"`
 }
 
+// Error returns a short, single-line representation suitable for the TUI/CLI.
 func (e *APIError) Error() string {
-	return e.Message
+	if e == nil {
+		return ""
+	}
+	if e.ErrorCode != "" {
+		return fmt.Sprintf("api error %d (%s): %s", e.StatusCode, e.ErrorCode, e.Message)
+	}
+	return fmt.Sprintf("api error %d: %s", e.StatusCode, e.Message)
+}
+
+// DetailedError returns a multi-line, human-readable dump with the relevant
+// wire-level details. Safe to print to a terminal.
+func (e *APIError) DetailedError() string {
+	if e == nil {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "API error %d %s\n", e.StatusCode, http.StatusText(e.StatusCode))
+	fmt.Fprintf(&b, "Request: %s %s\n", e.Method, e.URL)
+	if e.ErrorCode != "" || e.ErrorType != "" || e.ErrorParam != "" {
+		fmt.Fprintf(&b, "Upstream error: code=%q type=%q param=%q\n", e.ErrorCode, e.ErrorType, e.ErrorParam)
+	}
+	if e.Message != "" {
+		fmt.Fprintf(&b, "Message: %s\n", e.Message)
+	}
+	if len(e.Headers) > 0 {
+		fmt.Fprintln(&b, "Response headers:")
+		for k, v := range e.Headers {
+			fmt.Fprintf(&b, "  %s: %s\n", k, v)
+		}
+	}
+	if e.ResponseRaw != "" {
+		fmt.Fprintf(&b, "Response body:\n%s\n", e.ResponseRaw)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// fromAPIError converts an OpenAI SDK error into our APIError using the public
+// *openai.Error type. The SDK documents errors.As plus DumpRequest/DumpResponse
+// as the supported way to access the serialized request/response.
+func fromAPIError(err error) *APIError {
+	if err == nil {
+		return nil
+	}
+
+	var apiErr *openai.Error
+	if !errors.As(err, &apiErr) {
+		return nil
+	}
+
+	out := &APIError{
+		StatusCode: apiErr.StatusCode,
+		Message:    apiErr.Message,
+		ErrorCode:  apiErr.Code,
+		ErrorParam: apiErr.Param,
+		ErrorType:  apiErr.Type,
+	}
+
+	if apiErr.Request != nil {
+		out.Method = apiErr.Request.Method
+		if apiErr.Request.URL != nil {
+			out.URL = apiErr.Request.URL.String()
+		}
+
+		if dump := apiErr.DumpRequest(true); len(dump) > 0 {
+			out.RequestDump = string(dump)
+			out.RequestBody = extractHTTPBody(out.RequestDump)
+		}
+
+		if out.RequestBody == "" && apiErr.Request.GetBody != nil {
+			if rc, gerr := apiErr.Request.GetBody(); gerr == nil && rc != nil {
+				if data, rerr := io.ReadAll(rc); rerr == nil {
+					out.RequestBody = string(data)
+				}
+				_ = rc.Close()
+			}
+		}
+	}
+
+	if apiErr.Response != nil {
+		headers := make(map[string]string, len(apiErr.Response.Header))
+		for k, v := range apiErr.Response.Header {
+			headers[strings.ToLower(k)] = strings.Join(v, ", ")
+		}
+		out.Headers = headers
+
+		if dump := apiErr.DumpResponse(true); len(dump) > 0 {
+			out.ResponseDump = string(dump)
+			out.ResponseRaw = extractHTTPBody(out.ResponseDump)
+		}
+	}
+
+	applyStructuredErrorBody(out)
+
+	if out.Message == "" {
+		out.Message = strings.TrimSpace(err.Error())
+	}
+	if out.Message == "" && out.ResponseRaw != "" {
+		out.Message = out.ResponseRaw
+	}
+
+	return out
+}
+
+func wrapAPIError(err error) error {
+	if apiErr := fromAPIError(err); apiErr != nil {
+		return apiErr
+	}
+	return err
+}
+
+func extractHTTPBody(dump string) string {
+	if dump == "" {
+		return ""
+	}
+	if _, body, ok := strings.Cut(dump, "\r\n\r\n"); ok {
+		return strings.TrimRight(body, "\r\n")
+	}
+	if _, body, ok := strings.Cut(dump, "\n\n"); ok {
+		return strings.TrimRight(body, "\r\n")
+	}
+	return ""
+}
+
+func applyStructuredErrorBody(out *APIError) {
+	if out == nil || strings.TrimSpace(out.ResponseRaw) == "" {
+		return
+	}
+
+	decoder := json.NewDecoder(strings.NewReader(out.ResponseRaw))
+	decoder.UseNumber()
+
+	var body map[string]any
+	if err := decoder.Decode(&body); err != nil {
+		return
+	}
+
+	if rawErr, ok := body["error"]; ok {
+		switch e := rawErr.(type) {
+		case map[string]any:
+			setAPIErrorFields(out, e)
+		case string:
+			if out.Message == "" {
+				out.Message = e
+			}
+		}
+	}
+
+	setAPIErrorFields(out, body)
+}
+
+func setAPIErrorFields(out *APIError, fields map[string]any) {
+	if out == nil || fields == nil {
+		return
+	}
+	if out.Message == "" {
+		out.Message = jsonValueString(fields["message"])
+	}
+	if out.ErrorCode == "" {
+		out.ErrorCode = jsonValueString(fields["code"])
+	}
+	if out.ErrorParam == "" {
+		out.ErrorParam = jsonValueString(fields["param"])
+	}
+	if out.ErrorType == "" {
+		out.ErrorType = jsonValueString(fields["type"])
+	}
+}
+
+func jsonValueString(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return x
+	case json.Number:
+		return x.String()
+	case bool:
+		if x {
+			return "true"
+		}
+		return "false"
+	default:
+		data, err := json.Marshal(x)
+		if err == nil {
+			return string(data)
+		}
+		return fmt.Sprint(x)
+	}
+}
+
+// IsRetryable reports whether the API error is one of the well-known
+// retryable upstream failures.
+func (e *APIError) IsRetryable() bool {
+	if e == nil {
+		return false
+	}
+	switch e.StatusCode {
+	case 408, 409, 429, 500, 502, 503, 504:
+		return true
+	}
+	return false
 }
 
 type Model struct {
@@ -153,15 +375,15 @@ func (c *Client) ChatStreamChannelCtx(ctx context.Context, model string, message
 			maxTokens = 4096
 		}
 
-	params := openai.ChatCompletionNewParams{
-		Messages: chatMessages,
-		Model:    openai.ChatModel(model),
-		MaxTokens: openai.Int(int64(maxTokens)),
-		StreamOptions: openai.ChatCompletionStreamOptionsParam{
-			IncludeUsage: openai.Bool(true),
-		},
-		ParallelToolCalls: openai.Bool(true),
-	}
+		params := openai.ChatCompletionNewParams{
+			Messages:  chatMessages,
+			Model:     openai.ChatModel(model),
+			MaxTokens: openai.Int(int64(maxTokens)),
+			StreamOptions: openai.ChatCompletionStreamOptionsParam{
+				IncludeUsage: openai.Bool(true),
+			},
+			ParallelToolCalls: openai.Bool(true),
+		}
 
 		if len(tools) > 0 {
 			chatTools := make([]openai.ChatCompletionToolUnionParam, len(tools))
@@ -273,7 +495,7 @@ func (c *Client) ChatStreamChannelCtx(ctx context.Context, model string, message
 				ch <- StreamEvent{Type: "done"}
 				return
 			}
-			ch <- StreamEvent{Type: "error", Error: err}
+			ch <- StreamEvent{Type: "error", Error: wrapAPIError(err)}
 			return
 		}
 
@@ -332,7 +554,7 @@ func (c *Client) Chat(model string, messages []Message, tools []Tool, maxTokens 
 
 	completion, err := c.client.Chat.Completions.New(ctx, params)
 	if err != nil {
-		return Message{}, Usage{}, err
+		return Message{}, Usage{}, wrapAPIError(err)
 	}
 
 	if len(completion.Choices) == 0 {
@@ -372,7 +594,7 @@ func (c *Client) ListModels() ([]Model, error) {
 	ctx := context.Background()
 	models, err := c.client.Models.List(ctx)
 	if err != nil {
-		return nil, err
+		return nil, wrapAPIError(err)
 	}
 	result := make([]Model, len(models.Data))
 	for i, m := range models.Data {
